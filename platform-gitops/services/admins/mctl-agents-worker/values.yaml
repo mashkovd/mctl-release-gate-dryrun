@@ -215,3 +215,6 @@ externalSecret:
 # the soak covered and the owner re-enabled; set false to stop exporting.
 otel:
   enabled: true
+strategy:
+  type: Recreate
+  rollingUpdate: null
