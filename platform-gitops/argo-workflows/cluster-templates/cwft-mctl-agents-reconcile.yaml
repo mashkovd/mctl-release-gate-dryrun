@@ -1,0 +1,842 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterWorkflowTemplate
+metadata:
+  name: mctl-agents-reconcile
+  annotations:
+    workflows.argoproj.io/description: |
+      GitHub-first status reconciler for every proposal service.
+
+      Runs `orchestrator/run_shepherd.py --reconcile`, discovers canonical
+      feat/agents-* PRs even when `.status.yaml` lost its `pr` field, and
+      projects open/merged/closed/conflicted state. If a prior attempt pushed
+      commits but died before PR creation, it opens that one canonical PR. It
+      never runs a model, applies code fixes, or merges.
+
+      GitHub is authoritative; `.status.yaml` is the durable projection and
+      operator audit trail. This pass is the eventual-consistency safety net
+      for both shepherd-owned and steward-owned repositories.
+
+      Steps:
+        1. clone-gitops — SSH-clone mctl-gitops via the shared deploy key.
+        2. run-reconcile — `run_shepherd --reconcile` inside
+           ghcr.io/mctlhq/mctl-agents. Reads STATE_DIR + a GitHub PAT (read
+           only — `gh api` PR snapshots). No SDK credential needed.
+        3. commit-and-push — commits any .status.yaml transitions back to
+           gitops main (same `:(glob)` filter + mutex as the shepherd).
+
+      Triggered by:
+        - cron via CronWorkflow `mctl-agents-reconcile`
+        - one-shot Workflow referencing this CWFT via workflowTemplateRef +
+          clusterScope:true
+spec:
+  serviceAccountName: argo-workflow-sa
+  imagePullSecrets:
+    - name: ghcr-credentials
+  # Promtail maps these pod labels to the Loki `app` and `team` labels. Argo
+  # pods otherwise cannot be found through mctl_get_service_logs during an
+  # incident (incident-17841555) — cwft-mctl-agents-run.yaml has carried these
+  # since that incident; the rest of the agent templates did not, so their pods
+  # stayed invisible to log search. They also give NetworkPolicy a selector
+  # that picks out agent pods without catching platform workflows
+  # (deploy-service, create-tenant, ...) that share this namespace and do need
+  # in-cluster egress.
+  podMetadata:
+    labels:
+      app.kubernetes.io/name: mctl-agents
+      mctl.ai/team: admins
+  # 3d TTL, matching the shepherd template, so workflow history outlives the
+  # CronWorkflow's successfulJobsHistoryLimit at the low reconcile cadence.
+  ttlStrategy:
+    secondsAfterCompletion: 259200
+  # No volumeClaimGC: this workflow no longer creates a PVC at all. See the
+  # `volumes:` block below.
+  # 30-min budget: GitHub projection only. It may open a PR for an already
+  # pushed deterministic branch, but never runs SDK, review-fix, or merge.
+  activeDeadlineSeconds: 1800
+  entrypoint: reconcile-proposals
+  onExit: notify-telegram
+
+  arguments:
+    parameters:
+      - name: service
+        value: ""
+        # Optional. When set, reconcile only that service.
+      - name: dry_run
+        value: "false"
+        # When "true", discover + print would-be flips but write nothing.
+      - name: agent_image
+        value: ghcr.io/mctlhq/mctl-agents:1.117.0
+        # Default = today's pin, so submitting without this parameter is a
+        # zero-behaviour-change no-op. Overridden by the agent registry's
+        # resolved image_ref once a caller starts pinning per-run.
+      - name: agent_version
+        value: ""
+        # Registry version string, carried for the record only — not
+        # consumed by run-reconcile. Left blank by any caller not yet
+        # using the registry.
+
+  # ── No PVC ────────────────────────────────────────────────────────────────
+  # This used to be a `volumeClaimTemplates` entry requesting 2Gi, which Argo
+  # provisions as a Hetzner Cloud volume at workflow start — attach, use for
+  # ~2 minutes, detach, destroy. At 96 ticks/day that is 96 attach/detach
+  # cycles a day for a workdir that holds nothing durable: a shallow gitops
+  # clone and some .status.yaml edits.
+  #
+  # Hetzner attach/detach actions wedge (`running`/`progress:0` for 10-12h,
+  # no cancel API) and `stuck-pv-janitor` caught that 8 times in July 2026.
+  # A wedged attach leaves the pod Pending, and a Pending pod that holds
+  # `mctl-gitops-main-writes` is exactly the 2026-07-30 cascade. Removing the
+  # volume removes that entire failure mode from this workflow.
+  #
+  # An `emptyDir` at spec level gives EACH pod its own scratch dir (they are
+  # not shared — that is the whole reason the PVC existed). Cross-step state
+  # now travels as an Argo artifact instead; see `run-reconcile` below.
+  #
+  # sizeLimit + ephemeral-storage requests/limits are the other half of the
+  # win: unlike a PVC, emptyDir counts toward kubelet's ephemeral-storage
+  # accounting, so a runaway write evicts THIS pod instead of driving the node
+  # into DiskPressure and evicting whatever else happens to share it (vault,
+  # shared-pg live on the same three CX43 workers).
+  #
+  # This comment claimed both halves from #677 onward while only sizeLimit
+  # existed — no agent template declared ephemeral-storage at all until
+  # 2026-09-05. sizeLimit caps ONE volume and evicts the pod that overruns it;
+  # it tells the SCHEDULER nothing, so several agent pods could still be packed
+  # onto one node with no accounting for the gigabytes each intended to use.
+  # The requests on the workdir-mounting steps are what actually reserve it.
+  volumes:
+    - name: workdir
+      emptyDir:
+        sizeLimit: 2Gi
+    - name: deploy-key
+      secret:
+        secretName: mctl-gitops-deploy-key
+        defaultMode: 0600
+    # #2288: GITHUB_TOKEN is file-delivered (rotated every 30 min by
+    # rotate-github-app-tokens; kubelet refreshes the volume). 0440 with
+    # fsGroup 1000. Mounted only in the agent container.
+    - name: github-token-file
+      secret:
+        secretName: mctl-agents-secrets
+        defaultMode: 0440
+        items:
+          - key: github-token
+            path: github-token
+
+  templates:
+    - name: reconcile-proposals
+      steps:
+        - - name: reconcile
+            template: run-reconcile
+        - - name: commit
+            template: commit-and-push
+            arguments:
+              artifacts:
+                - name: status-updates
+                  from: "{{steps.reconcile.outputs.artifacts.status-updates}}"
+        # run_shepherd --reconcile writes .status.yaml flips to the worktree
+        # before any failure that may crash it, and those repairs MUST still
+        # reach main — that is what the old `continueOn: {failed, error}` on
+        # the reconcile step was for.
+        #
+        # continueOn is not usable any more: cross-step state now travels as
+        # an Argo artifact, and artifact collection from a pod that exited
+        # non-zero is not a guarantee worth betting a correctness property on.
+        # So `run-reconcile` swallows its own exit code (always exits 0, always
+        # emits the artifact) and reports it as an output parameter instead.
+        # This step turns that back into a workflow failure, AFTER the commit
+        # has landed.
+        - - name: assert-reconcile
+            template: assert-exit-code
+            arguments:
+              parameters:
+                - name: exit-code
+                  value: "{{steps.reconcile.outputs.parameters.exit-code}}"
+
+    # ── 1. Run reconcile (read-only) ──────────────────────────────────────
+    # `clone-gitops` used to be its own step, writing into a workdir PVC that
+    # the next two steps mounted. With the PVC gone it becomes an
+    # initContainer in each pod that needs a checkout — same script, same
+    # deploy key, just run twice (once here, once in commit-and-push) into
+    # each pod's own emptyDir.
+    #
+    # A second shallow clone costs ~2-5s. It also makes commit-and-push
+    # strictly SAFER than before: it rebases onto a checkout taken after the
+    # reconcile finished rather than one taken before it started, so the
+    # window in which main can move underneath us shrinks.
+    - name: run-reconcile
+      # Least privilege: this step needs neither the Kubernetes API nor Vault.
+      # The pod runs as an identity with no role bindings and mounts no API
+      # token into the agent or clone containers; only Argo's own init/wait
+      # containers get the executor token, to report the step result. See
+      # config/sa-and-rbac.yaml. Template-level on purpose: the other steps
+      # keep the workflow-level account.
+      serviceAccountName: mctl-agents-runner
+      automountServiceAccountToken: false
+      executor:
+        serviceAccountName: mctl-agents-executor
+      # Restricted pod posture for the step that runs model-driven shell
+      # (mctl-gitops#1717). Template-level: the helper steps are root images.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # kube-router admits a new pod's IP into the proxy's ingress ipset a
+        # few seconds after the pod starts; a first connection inside that
+        # window is dropped (gitops#2164). Hold the pod until the proxy
+        # accepts a TCP connect, at most ~90s.
+        - name: wait-egress-proxy
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              for i in $(seq 1 30); do
+                nc -z -w 2 agent-egress-proxy.mctl-agents-egress.svc.cluster.local 3128 && exit 0
+                sleep 1
+              done
+              echo "agent-egress-proxy unreachable after ~90s" >&2
+              exit 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+        - name: clone-gitops
+          image: alpine/git:2.43.0
+          env:
+            - name: HTTPS_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: HTTP_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: https_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: http_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: NO_PROXY
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: no_proxy
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+              value: "1"
+          # Root on purpose: apk add + chown -R 1000:1000 /workdir hand-off
+          # (validate-local-workdir.py). Escalation is off and every capability
+          # except the file-ownership ones is dropped (mctl-gitops#1717).
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+          command: [sh, -c]
+          args:
+            - |
+              set -e
+              apk add --no-cache openssh-client ca-certificates socat
+              mkdir -p ~/.ssh
+              cp /secrets/deploy-key/ssh-privatekey ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  ProxyCommand socat - PROXY:agent-egress-proxy.mctl-agents-egress.svc.cluster.local:%%h:%%p,proxyport=3128\n  IdentityFile ~/.ssh/id_ed25519\n  ConnectTimeout 15\n  ServerAliveInterval 5\n  ServerAliveCountMax 3\n' > ~/.ssh/config
+              chmod 600 ~/.ssh/config
+              # ConnectTimeout / ServerAlive* above bound every SSH
+              # connection in this step. A stalled TCP handshake has no
+              # other timeout and would otherwise eat the workflow's whole
+              # 30-min deadline (observed 2026-07-16, gitops#593 follow-up —
+              # the clone ran 31 min before the deadline killed it).
+              # Host-key verification is the pinned known_hosts below.
+              # GitHub's published SSH host keys, PINNED rather than trusted on
+              # first use. Source: https://api.github.com/meta (.ssh_keys),
+              # fetched 2026-09-02. This replaces an `ssh-keyscan` of
+              # ssh.github.com, which is trust-on-first-use: it accepted
+              # whatever key answered, on a connection carrying a
+              # WRITE-capable deploy key. A MITM or DNS-poison was recorded
+              # as the truth and then honoured.
+              #
+              # Keyed on [ssh.github.com]:443 — ssh looks up the host and
+              # port it actually connects to, which the Host block rewrites.
+              #
+              # If GitHub rotates a host key these lines must be updated; it
+              # last happened in March 2023, when the RSA key was replaced.
+              cat > ~/.ssh/known_hosts <<'GITHUB_HOST_KEYS'
+              [ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+              [ssh.github.com]:443 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+              [ssh.github.com]:443 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+              GITHUB_HOST_KEYS
+              chmod 600 ~/.ssh/known_hosts
+              # Bounded retry. On 2026-11-04 10:54-11:16Z GitHub dropped SSH
+              # sessions right after the handshake (proxy tunnels were 200), every
+              # clone exited 128 and each failed run fanned out into an incident.
+              # Same key and URL on every try; git prints its own stderr.
+              for attempt in 1 2 3; do
+                if git clone --depth=1 git@github.com:mctlhq/mctl-gitops.git /workdir/mctl-gitops; then
+                  break
+                fi
+                rm -rf /workdir/mctl-gitops
+                if [ "$attempt" = 3 ]; then
+                  echo "clone-gitops: git clone failed after 3 attempts" >&2
+                  exit 128
+                fi
+                echo "clone-gitops: attempt $attempt failed, retrying" >&2
+                sleep $((attempt * 15))
+              done
+              mkdir -p /workdir/mctl-gitops/platform-gitops/agents-state
+              # uid 1000 is the mctl-agents image USER (SOC F8). This init
+              # container runs as root in alpine/git; without the handoff the
+              # main container cannot write STATE_DIR.
+              chown -R 1000:1000 /workdir
+              echo "gitops cloned"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi, ephemeral-storage: 2Gi }
+            limits:   { cpu: 500m, memory: 256Mi, ephemeral-storage: 3Gi }
+          volumeMounts:
+            - name: workdir
+              mountPath: /workdir
+            - name: deploy-key
+              mountPath: /secrets/deploy-key
+      outputs:
+        parameters:
+          # The reconcile's REAL exit code. The step itself always exits 0 (see
+          # below), so this is the only thing that can fail the workflow — the
+          # assert-reconcile step reads it after commit-and-push has run.
+          - name: exit-code
+            valueFrom:
+              path: /tmp/exit-code
+              # If the pod died before writing the file (OOM, node eviction,
+              # deadline) there is nothing to commit either. Report a distinct
+              # non-zero value rather than silently passing.
+              default: "254"
+        artifacts:
+          # The .status.yaml files the reconcile wrote, at their repo-relative
+          # paths. This replaces the shared workdir PVC as the cross-step
+          # channel. Always exists (the dir is created unconditionally), so
+          # collection never fails on an empty run.
+          - name: status-updates
+            path: /tmp/status-out
+      container:
+        image: "{{workflow.parameters.agent_image}}"
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        imagePullPolicy: IfNotPresent
+        command: ["/entrypoint.sh"]
+        args:
+          - "sh"
+          - "-c"
+          - |
+            set -e
+            # Built CLEAN, not just created. This directory IS the
+            # artifact, and the reconcile process runs as a child of this
+            # script in this same container — so anything it drops in here
+            # is handed to commit-and-push and laid over a trusted
+            # checkout. Only the copy loop below is supposed to fill it
+            # (agy P1 on gitops#982, round 4).
+            rm -rf /tmp/status-out
+            mkdir -p /tmp/status-out
+
+            # Build argv via `set --` so workflow params (injected as env)
+            # are separate, quoted tokens — never spliced into the shell.
+            set -- python -m orchestrator.run_shepherd --reconcile
+            if [ -n "$WORKFLOW_SERVICE" ]; then
+              set -- "$@" --service "$WORKFLOW_SERVICE"
+            fi
+            if [ "$WORKFLOW_DRY_RUN" = "true" ]; then
+              set -- "$@" --dry-run
+            fi
+            printf '→'
+            printf ' %s' "$@"
+            printf '\n'
+
+            # Deliberately NOT `exec`, and deliberately not fatal. run_shepherd
+            # --reconcile writes .status.yaml flips to the worktree before any
+            # failure that may crash it, and those repairs must still reach
+            # main. Previously that was handled by `continueOn: {failed,
+            # error}` on this step plus a shared PVC. With an artifact handoff
+            # we cannot rely on Argo collecting outputs from a pod that exited
+            # non-zero, so this step swallows the code and hands it on as an
+            # output parameter for assert-reconcile to act on.
+            set +e
+            "$@"
+            RC=$?
+            set -e
+            printf '%s' "$RC" > /tmp/exit-code
+            echo "reconcile exited ${RC}"
+
+            # Collect exactly what commit-and-push is allowed to push:
+            # .status.yaml files under agents-state that actually changed.
+            # Anything else changing there is a bug, and commit-and-push still
+            # refuses it independently.
+            cd /workdir/mctl-gitops
+            # -z, then tr, then cut -c4-. WITHOUT -z, porcelain quotes and
+            # C-escapes any path with a space or a non-ASCII byte — ` M "a/my
+            # service/.status.yaml"` — and the quotes survive cut, so the
+            # `[ -f "$f" ]` check below fails and the update is silently
+            # dropped from the handoff: the flip never reaches main and the
+            # log says only "skipping (not a regular file)". The comment here
+            # claimed the opposite ("survives paths containing spaces") until
+            # 2026-09-02; measured, a plain space is enough (agy P2 on
+            # gitops#982). -z emits raw unquoted paths, NUL-separated.
+            # Residual limit, unchanged and stated rather than implied: a path
+            # containing a literal newline would still split wrongly. reconcile
+            # never renames, so the "old -> new" rename form cannot appear.
+            CHANGED=$(git status --porcelain -z -- ':(glob)platform-gitops/agents-state/**/.status.yaml' | tr '\0' '\n' | cut -c4-)
+            if [ -z "$CHANGED" ]; then
+              echo "no .status.yaml changes to hand off"
+              exit 0
+            fi
+            printf '%s\n' "$CHANGED" | while IFS= read -r f; do
+              # A deletion would leave a porcelain entry with no file on disk.
+              # reconcile only ever flips statuses, but skip rather than fail
+              # the handoff if that ever changes.
+              [ -f "$f" ] || { echo "skipping ${f} (not a regular file)"; continue; }
+              mkdir -p "/tmp/status-out/$(dirname "$f")"
+              cp -a "$f" "/tmp/status-out/$f"
+              echo "handing off $f"
+            done
+        env:
+          - name: HTTPS_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: HTTP_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: https_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: http_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: NO_PROXY
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: no_proxy
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            value: "1"
+          # Workflow params as env (NOT inline {{...}} in the script body —
+          # that is a shell-injection vector).
+          - name: WORKFLOW_SERVICE
+            value: "{{workflow.parameters.service}}"
+          - name: WORKFLOW_DRY_RUN
+            value: "{{workflow.parameters.dry_run}}"
+          - name: STATE_DIR
+            value: /workdir/mctl-gitops/platform-gitops/agents-state
+          # GitHub PAT use: PR snapshots and idempotent PR creation for an
+          # already-pushed deterministic branch. No code push or merge from
+          # this container (commit-and-push owns only the status projection).
+          # No CLAUDE_CODE_OAUTH_TOKEN — --reconcile skips SDK auth entirely.
+          # NOT optional: a non-dry reconcile run requires the token; a missing
+          # secret should fail at pod-scheduling time, not as an opaque runtime
+          # `gh api` auth error. The in-cluster secret always carries this key.
+          # #2288: the token is delivered only as a file (no secretKeyRef env
+          # seed); refresh_github_token() reads it before the first and every
+          # later gh/git call. The mounted file is model-readable (mctl-agents#869).
+          - name: GITHUB_TOKEN_FILE
+            value: /var/run/gh/github-token
+        resources:
+          requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 2Gi }
+          limits:   { cpu: 1000m, memory: 1Gi, ephemeral-storage: 3Gi }
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+          - name: github-token-file
+            mountPath: /var/run/gh
+            readOnly: true
+
+    # ── 3. Commit & push back to mctl-gitops ──────────────────────────────
+    # Only .status.yaml files should change in agents-state/ (run_shepherd
+    # --reconcile writes them on each terminal flip). Defensive: stage only
+    # that subtree. Same shape + mutex as the shepherd's commit-and-push.
+    - name: commit-and-push
+      synchronization:
+        mutex:
+          name: mctl-gitops-main-writes
+      inputs:
+        artifacts:
+          # The .status.yaml files run-reconcile wrote, at their repo-relative
+          # paths. Unpacked here, then copied over this pod's own fresh clone.
+          - name: status-updates
+            path: /artifact
+      initContainers:
+        # kube-router admits a new pod's IP into the proxy's ingress ipset a
+        # few seconds after the pod starts; a first connection inside that
+        # window is dropped (gitops#2164). Hold the pod until the proxy
+        # accepts a TCP connect, at most ~90s.
+        - name: wait-egress-proxy
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              for i in $(seq 1 30); do
+                nc -z -w 2 agent-egress-proxy.mctl-agents-egress.svc.cluster.local 3128 && exit 0
+                sleep 1
+              done
+              echo "agent-egress-proxy unreachable after ~90s" >&2
+              exit 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+        # Same clone as run-reconcile's init — see the comment above that
+        # template for why this is duplicated rather than shared. Note this
+        # checkout is taken AFTER the reconcile finished, so the rebase window
+        # below is strictly narrower than it was with the old shared PVC.
+        - name: clone-gitops
+          image: alpine/git:2.43.0
+          env:
+            - name: HTTPS_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: HTTP_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: https_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: http_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: NO_PROXY
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: no_proxy
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+              value: "1"
+          command: [sh, -c]
+          args:
+            - |
+              set -e
+              apk add --no-cache openssh-client ca-certificates socat
+              mkdir -p ~/.ssh
+              cp /secrets/deploy-key/ssh-privatekey ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  ProxyCommand socat - PROXY:agent-egress-proxy.mctl-agents-egress.svc.cluster.local:%%h:%%p,proxyport=3128\n  IdentityFile ~/.ssh/id_ed25519\n  ConnectTimeout 15\n  ServerAliveInterval 5\n  ServerAliveCountMax 3\n' > ~/.ssh/config
+              chmod 600 ~/.ssh/config
+              # GitHub's published SSH host keys, PINNED rather than trusted on
+              # first use. Source: https://api.github.com/meta (.ssh_keys),
+              # fetched 2026-09-02. This replaces an `ssh-keyscan` of
+              # ssh.github.com, which is trust-on-first-use: it accepted
+              # whatever key answered, on a connection carrying a
+              # WRITE-capable deploy key. A MITM or DNS-poison was recorded
+              # as the truth and then honoured.
+              #
+              # Keyed on [ssh.github.com]:443 — ssh looks up the host and
+              # port it actually connects to, which the Host block rewrites.
+              #
+              # If GitHub rotates a host key these lines must be updated; it
+              # last happened in March 2023, when the RSA key was replaced.
+              cat > ~/.ssh/known_hosts <<'GITHUB_HOST_KEYS'
+              [ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+              [ssh.github.com]:443 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+              [ssh.github.com]:443 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+              GITHUB_HOST_KEYS
+              chmod 600 ~/.ssh/known_hosts
+              # Bounded retry. On 2026-11-04 10:54-11:16Z GitHub dropped SSH
+              # sessions right after the handshake (proxy tunnels were 200), every
+              # clone exited 128 and each failed run fanned out into an incident.
+              # Same key and URL on every try; git prints its own stderr.
+              for attempt in 1 2 3; do
+                if git clone --depth=1 git@github.com:mctlhq/mctl-gitops.git /workdir/mctl-gitops; then
+                  break
+                fi
+                rm -rf /workdir/mctl-gitops
+                if [ "$attempt" = 3 ]; then
+                  echo "clone-gitops: git clone failed after 3 attempts" >&2
+                  exit 128
+                fi
+                echo "clone-gitops: attempt $attempt failed, retrying" >&2
+                sleep $((attempt * 15))
+              done
+              echo "gitops cloned"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi, ephemeral-storage: 2Gi }
+            limits:   { cpu: 500m, memory: 256Mi, ephemeral-storage: 3Gi }
+          volumeMounts:
+            - name: workdir
+              mountPath: /workdir
+            - name: deploy-key
+              mountPath: /secrets/deploy-key
+      script:
+        image: alpine/git:2.43.0
+        env:
+          - name: HTTPS_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: HTTP_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: https_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: http_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: NO_PROXY
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: no_proxy
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            value: "1"
+        command: [sh]
+        resources:
+          requests: { cpu: 50m, memory: 64Mi, ephemeral-storage: 2Gi }
+          limits:   { cpu: 500m, memory: 256Mi, ephemeral-storage: 3Gi }
+        source: |
+          set -e
+          apk add --no-cache openssh-client ca-certificates socat
+          mkdir -p ~/.ssh
+          cp /secrets/deploy-key/ssh-privatekey ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  ProxyCommand socat - PROXY:agent-egress-proxy.mctl-agents-egress.svc.cluster.local:%%h:%%p,proxyport=3128\n  IdentityFile ~/.ssh/id_ed25519\n  ConnectTimeout 15\n  ServerAliveInterval 5\n  ServerAliveCountMax 3\n' > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+          # ConnectTimeout / ServerAlive* above bound every SSH connection
+          # in this step so a network stall fails in ~15-30s instead of
+          # silently eating the workflow's 30-min activeDeadlineSeconds (see
+          # the clone-gitops initContainer for the observed incident).
+          # Host-key verification is the pinned known_hosts below.
+          # GitHub's published SSH host keys, PINNED rather than trusted on
+          # first use. Source: https://api.github.com/meta (.ssh_keys),
+          # fetched 2026-09-02. This replaces an `ssh-keyscan` of
+          # ssh.github.com, which is trust-on-first-use: it accepted
+          # whatever key answered, on a connection carrying a
+          # WRITE-capable deploy key. A MITM or DNS-poison was recorded
+          # as the truth and then honoured.
+          #
+          # Keyed on [ssh.github.com]:443 — ssh looks up the host and
+          # port it actually connects to, which the Host block rewrites.
+          #
+          # If GitHub rotates a host key these lines must be updated; it
+          # last happened in March 2023, when the RSA key was replaced.
+          cat > ~/.ssh/known_hosts <<'GITHUB_HOST_KEYS'
+          [ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          [ssh.github.com]:443 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          [ssh.github.com]:443 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          GITHUB_HOST_KEYS
+          chmod 600 ~/.ssh/known_hosts
+
+          # Lay the handed-off .status.yaml files over the fresh checkout done
+          # by this pod's clone-gitops initContainer. An empty artifact means
+          # the reconcile had nothing to repair — the common case — and the
+          # "no diff" guards below then exit 0 exactly as they did before.
+          if [ -d /artifact/platform-gitops ] && [ -n "$(ls -A /artifact/platform-gitops 2>/dev/null)" ]; then
+            # Copy the repository subtree only, never the artifact root:
+            # `cp -a /artifact/.` would overlay a `.git/` in the artifact
+            # onto the fresh clone's own, and git executes what it finds
+            # there (hooks, core.sshCommand) as root in the next step.
+            cp -a /artifact/platform-gitops/. /workdir/mctl-gitops/platform-gitops/
+            echo "applied handed-off status updates"
+          else
+            echo "no handed-off status updates"
+          fi
+
+          # No `safe.directory` here, deliberately. That line existed because
+          # the SHARED clone step chowned /workdir to uid 1000 for the agent,
+          # leaving this root container facing git's dubious-ownership refusal
+          # (incident 2026-08-14 23:02). #677 replaced that with the
+          # initContainer above: it clones as root into this pod's own
+          # emptyDir, the script container is root too, so the ownership check
+          # passes on its own and stays armed. The comment survived the change
+          # and described a chown that no longer happens.
+          cd /workdir/mctl-gitops
+          git config user.name "mctl-agents[bot]"
+          git config user.email "mctl-agents[bot]@users.noreply.github.com"
+
+          # Stage only .status.yaml updates under agents-state. Anything else
+          # changed there is NOT what this workflow should push — fail loudly.
+          # The scan still covers the WHOLE repository rather than just
+          # agents-state/, because the old agents-state/-anchored pathspec
+          # could not see a change anywhere else in the repo (agy P1 on #982).
+          #
+          # No `git reset -q origin/main` before it, though. That existed to
+          # unwind what the SDK agent might have staged or committed in a
+          # worktree it SHARED with this step — the reasoning that made it
+          # neither a bare `git reset` nor a fresh fetch. Since #677 this pod
+          # clones for itself and the agent never touches this checkout: the
+          # index is at origin/main already, nothing is staged, and the reset
+          # was a no-op whose comment claimed a hazard the template no longer
+          # has.
+          NON_STATUS_CHANGES="$(git status --porcelain -- ':(exclude,glob)platform-gitops/agents-state/**/.status.yaml')"
+          if [ -n "$NON_STATUS_CHANGES" ]; then
+            echo "❌ Refusing to commit changes outside .status.yaml files under platform-gitops/agents-state/:" >&2
+            printf '%s\n' "$NON_STATUS_CHANGES" >&2
+            exit 1
+          fi
+
+          # Short-circuit BEFORE `git add`: a glob pathspec matching zero files
+          # crashes under `set -e`. A reconcile tick with nothing to repair is
+          # the common case.
+          STATUS_CHANGES="$(git status --porcelain -- ':(glob)platform-gitops/agents-state/**/.status.yaml')"
+          if [ -z "$STATUS_CHANGES" ]; then
+            echo "ℹ️  No .status.yaml updates — nothing to reconcile."
+            exit 0
+          fi
+          git add -- ':(glob)platform-gitops/agents-state/**/.status.yaml'
+
+          if git diff --cached --quiet; then
+            echo "ℹ️  No status updates after staging — nothing to commit."
+            exit 0
+          fi
+
+          DATE=$(date -u +%Y-%m-%d)
+          git commit -m "chore(agents): reconcile status ${DATE}"
+
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              echo "✅ Pushed status updates"
+              exit 0
+            fi
+            echo "⚠️  Push failed (attempt ${i}), rebasing..."
+            # Guarded: `set -e` is active, so an unguarded failure here —
+            # a rebase conflict, a transient network error — kills the
+            # script on the FIRST retry instead of trying the remaining
+            # attempts, and the "failed after 5 attempts" line never prints
+            # (agy P3 on gitops#982). Abort a half-applied rebase so the
+            # next iteration starts from a clean worktree.
+            if ! git pull --rebase origin main; then
+              git rebase --abort 2>/dev/null || true
+              echo "⚠️  Rebase failed (attempt ${i}); retrying" >&2
+            fi
+          done
+          echo "❌ Push failed after 5 attempts"
+          exit 1
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+          - name: deploy-key
+            mountPath: /secrets/deploy-key
+
+    # ── 3. Truthful status ────────────────────────────────────────────────
+    # run-reconcile always exits 0 so its artifact is always collected (see
+    # that template). This is what turns a real reconcile failure back into a
+    # workflow failure — and it runs AFTER commit-and-push, so a crashed
+    # reconcile still gets its partial .status.yaml repairs pushed first,
+    # which is exactly what the old `continueOn: {failed, error}` guaranteed.
+    - name: assert-exit-code
+      inputs:
+        parameters:
+          - name: exit-code
+      script:
+        image: alpine:3.19
+        command: [sh]
+        env:
+          - name: RECONCILE_EXIT_CODE
+            value: "{{inputs.parameters.exit-code}}"
+        resources:
+          requests: { cpu: 10m, memory: 32Mi }
+          limits:   { cpu: 100m, memory: 64Mi }
+        source: |
+          set -e
+          if [ "$RECONCILE_EXIT_CODE" = "0" ]; then
+            echo "reconcile succeeded"
+            exit 0
+          fi
+          if [ "$RECONCILE_EXIT_CODE" = "254" ]; then
+            echo "reconcile pod produced no exit code — it died before"
+            echo "finishing (OOM, eviction, or deadline). Any .status.yaml"
+            echo "repairs it had already written were still committed."
+            exit 1
+          fi
+          echo "reconcile failed with exit ${RECONCILE_EXIT_CODE};"
+          echo "its .status.yaml repairs were committed first."
+          exit 1
+
+    # ── Telegram notification (onExit) ────────────────────────────────────
+    - name: notify-telegram
+      initContainers:
+        # kube-router admits a new pod's IP into the proxy's ingress ipset a
+        # few seconds after the pod starts; a first connection inside that
+        # window is dropped (gitops#2164). Hold the pod until the proxy
+        # accepts a TCP connect, at most ~90s.
+        - name: wait-egress-proxy
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              for i in $(seq 1 30); do
+                nc -z -w 2 agent-egress-proxy.mctl-agents-egress.svc.cluster.local 3128 && exit 0
+                sleep 1
+              done
+              echo "agent-egress-proxy unreachable after ~90s" >&2
+              exit 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+      script:
+        image: alpine:3.19
+        command: [sh]
+        env:
+          - name: HTTPS_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: HTTP_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: https_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: http_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: NO_PROXY
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: no_proxy
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            value: "1"
+          - name: TG_BOT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: telegram-bot-token
+                optional: true
+          - name: TG_CHAT_ID
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: telegram-chat-id
+                optional: true
+          - name: WORKFLOW_STATUS
+            value: "{{workflow.status}}"
+          - name: WORKFLOW_NAME
+            value: "{{workflow.name}}"
+          - name: WORKFLOW_DURATION
+            value: "{{workflow.duration}}"
+        source: |
+          set +e
+          # Hourly job — same "quiet unless it did something or failed" policy
+          # as argo-pvc-janitor. reconcile only repairs rare dropped
+          # write-backs (see the CronWorkflow description), so a routine
+          # Succeeded tick has nothing worth reporting; only notify on a
+          # non-Succeeded terminal status.
+          if [ "$WORKFLOW_STATUS" = "Succeeded" ]; then
+            echo "reconcile succeeded; routine tick, skipping Telegram notify."
+            exit 0
+          fi
+          apk add --no-cache curl ca-certificates >/dev/null 2>&1
+          case "$WORKFLOW_STATUS" in
+            Failed) ICON="❌" ;;
+            Error)  ICON="⚠️" ;;
+            *)      ICON="⏳" ;;
+          esac
+          UI_URL="https://workflows.mctl.ai/workflows/argo-workflows/${WORKFLOW_NAME}"
+          TEXT="${ICON} mctl-agents: reconcile — ${WORKFLOW_STATUS} (${WORKFLOW_DURATION}s)\n${UI_URL}"
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -o /dev/null -w 'telegram http=%{http_code}\n' \
+              -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${TG_CHAT_ID}\",\"text\":\"${TEXT}\",\"disable_web_page_preview\":true}"
+          else
+            echo "ℹ️  TG_BOT_TOKEN or TG_CHAT_ID not set; skipping Telegram leg."
+          fi
+          exit 0

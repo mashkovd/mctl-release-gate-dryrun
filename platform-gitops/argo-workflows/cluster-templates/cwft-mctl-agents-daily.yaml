@@ -1,0 +1,41 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: mctl-agents-daily
+  namespace: argo-workflows
+  annotations:
+    workflows.argoproj.io/description: |
+      Weekly Saturday 00:00 UTC trigger for the full mctl-agents pipeline.
+
+      All workflow logic now lives in ClusterWorkflowTemplate
+      `mctl-agents-run` (cwft-mctl-agents-run.yaml). This CronWorkflow is
+      a thin wrapper that submits a Workflow with mode=full once per week.
+
+      Other entry points reference the same template with different
+      parameters:
+        - mctl-api MCP tool mctl_trigger_mentor_only      → mode=mentor-only
+        - mctl-api MCP tool mctl_trigger_single_service   → mode=single-service, service=<name>
+        - mctl-api MCP tool mctl_trigger_agents_run       → mode=full (same as this cron, on demand)
+spec:
+  schedule: "0 0 * * 6"
+  timezone: "UTC"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  # Counts, NOT days. The cron is once-per-week (`0 0 * * 6` — Sat 00:00
+  # UTC), so 14 successes ≈ 14 weeks and 7 failures ≈ 7 weeks — a much
+  # longer retroactive-triage window than the previous daily cron
+  # provided, which we want now that runs are rarer. Default 3 masked
+  # the firing pattern during the 2026-05-07 ESO triage
+  # (~/.claude/plans/mctl-agents-daily-cron-visibility.md).
+  successfulJobsHistoryLimit: 14
+  failedJobsHistoryLimit: 7
+  workflowSpec:
+    workflowTemplateRef:
+      name: mctl-agents-run
+      clusterScope: true
+    arguments:
+      parameters:
+        - name: mode
+          value: "full"
+        - name: service
+          value: ""

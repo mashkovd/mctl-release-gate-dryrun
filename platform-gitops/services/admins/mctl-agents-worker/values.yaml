@@ -1,0 +1,217 @@
+# Worker: mctl-agents-worker
+# Team: admins
+# Chart: base-service (ingress disabled)
+#
+# Temporal worker for the dev-workflow control plane (plan phase 4):
+# DevLoopWorkflow (issue -> investigate -> approve -> implement) plus its
+# activities (resolve_agent_release, submit_and_wait, record_execution).
+# Rides the same ghcr.io/mctlhq/mctl-agents image every CWFT already uses,
+# with a different command — no separate build. Unlike kuptsi-app's
+# temporal-worker (a sibling container on an HTTP service), this is a
+# standalone Deployment: nothing here serves inbound traffic, so there is
+# no main container to ride alongside.
+#
+# orchestrator/temporal/ shipped in mctl-agents PR #105, first released in
+# 1.22.0 — replicaCount and image.tag bumped together in the same commit,
+# per the crash-loop warning this comment used to carry (module doesn't
+# exist before 1.22.0, so splitting the two edits would crash-loop the pod
+# in the window between them).
+#
+# This tag is bumped by hand. `chore: bump admins/mctl-agents to <x>` (the
+# automated bump) only rewrites the six CWFT image params in
+# argo-workflows/cluster-templates/ — it does not touch this file, so the
+# worker silently stays behind until someone edits it here.
+replicaCount: 1
+image:
+  repository: ghcr.io/mctlhq/mctl-agents
+  tag: "1.117.0"
+imagePullSecrets:
+  - name: ghcr-credentials
+# --role control since the queue split (ADR-008): this process runs every
+# workflow and every short activity on `mctl-dev-loop`, while
+# mctl-agents-worker-exec serves submit_and_wait on `mctl-dev-loop-exec`.
+#
+# It still registers submit_and_wait itself, deliberately — nothing routes
+# to the exec queue until the patched flip lands in mctl-agents, so a
+# control worker that dropped it would strand every Argo submit the moment
+# it rolled out.
+#
+# Requires 1.35.0 or later; older images argparse-error on --role.
+command: ["python", "-m", "orchestrator.temporal.worker", "--role", "control"]
+ingress:
+  enabled: false
+# The chart's own values.yaml defaults probes.liveness/readiness to
+# httpGet /healthz and /readyz — fine for an HTTP service, fatal here: this
+# worker is a pure asyncio process with no HTTP server at all, so an
+# inherited default would CrashLoopBackOff it against a port nothing
+# listens on. Helm deep-merges values.yaml files, so `probes: {}` merges
+# nothing away and the chart defaults survive untouched (verified via `helm
+# template`) — each leaf must be nulled individually instead. `probes:
+# null` outright (tried first) also fails: the deployment template
+# dereferences .Values.probes.startup unconditionally before checking
+# truthiness, which errors on a nil .Values.probes even though startup has
+# no chart default to begin with.
+probes:
+  liveness: null
+  readiness: null
+resources:
+  # Light footprint on purpose: this process only polls HTTP endpoints
+  # (mctl-api, Temporal frontend) — it never spawns the Claude Code CLI or
+  # clones a repo, unlike agent-worker-preview or the Argo CWFT pods.
+  #
+  # That stopped being true when the incident responder moved into
+  # IncidentLoopWorkflow as an in-process activity: it ran a Claude SDK
+  # session here, against a pod with no gitops checkout to write proposals
+  # into, and was OOMKilled every tick (8 restarts, 2026-08-15). Reverting
+  # to an Argo submit (mctl-agents 1.28.2, #180) makes the claim above
+  # accurate again — which is why 256Mi stays.
+  requests:
+    cpu: 50m
+    memory: 320Mi
+  limits:
+    cpu: 500m
+    memory: 576Mi
+automountServiceAccountToken: false
+# 1.28.0 is the first tag with USER app (uid 1000) in the image.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+# Read-only root (the chart default). Run-time writes, measured on the live pod
+# 2026-10-18: tempfiles under /tmp, and `gh` (called through run_shepherd)
+# keeping its state in ~/.local/state/gh. The other ~950 files were Python
+# bytecode under /app; PYTHONDONTWRITEBYTECODE below stops those attempts.
+writablePaths:
+  - /tmp
+  - /home/app/.local
+env:
+  MCTL_TRACE_WORKFLOW_TYPES: DevLoopWorkflow
+  # The image ships no precompiled bytecode for the app, so on a read-only
+  # root Python would try and fail to write a .pyc for every module it imports.
+  PYTHONDONTWRITEBYTECODE: "1"
+  MCTL_TRACE_ARGO_PARAM: "true"
+  TEMPORAL_ADDRESS: temporal-frontend.temporal.svc.cluster.local:7233
+  TEMPORAL_NAMESPACE: mctl-agents
+  LOG_LEVEL: info
+  # The lifecycle rollout stage (ADR-010 §12, mctlhq/.github#57).
+  #
+  # This worker runs DevLoopWorkflow, the only WRITER. It flips FIRST, ahead of
+  # the shepherd CWFT and ahead of the ownership bootstrap, and the order is
+  # not cosmetic: below `observe` the ownership activity short-circuits before
+  # any HTTP call, so a row the bootstrap wrote for a devloop-workflow owner
+  # would never be heartbeated, progressed or released by the workflow it
+  # names. It would sit `active` until its liveness bound expired, held by an
+  # owner that does not know it holds anything.
+  #
+  # Writer live -> bootstrap -> shepherd flips and the comparison starts
+  # against a populated store.
+  #
+  # The gate is in ACTIVITY code, not workflow code, so this does not change
+  # which commands the workflow issues: a history recorded under one mode
+  # replays under another.
+  LIFECYCLE_ROLLOUT_MODE: observe
+  # GitHub App installation tokens expire after 60 min. rotate-github-app-tokens
+  # mints a fresh one every 30 min into Vault, but env vars are frozen at
+  # container start, so a long-lived pod like this one is authenticated for at
+  # most an hour and then 401s forever. orchestrator/github_token.py exists for
+  # exactly this and re-reads the token before every gh/git subprocess — but
+  # only when GITHUB_TOKEN_FILE points at a mounted file, which was never set
+  # here. Its docstring assumes issue-poll is a short-lived Argo cron pod whose
+  # run "fits inside one token's TTL"; that stopped being true when issue-poll
+  # moved into this permanent Temporal worker.
+  GITHUB_TOKEN_FILE: /var/run/secrets/github/GITHUB_TOKEN
+  # The execution-request dispatcher (mctl-agents#461 option A, #487): claims
+  # pending mctl-api execution requests and delivers each to the issue's
+  # DevLoop with Update-with-Start. Code default is off; only this worker
+  # (the role that owns the schedules) runs it, and the exec/implement
+  # workers ignore the flag. It claims, fulfils and rejects as MCTL_TOKEN,
+  # the mctl-agent service principal mctl-api requires for those routes.
+  # Live proof: mctl-agents#490. Set to "false" to turn it off again; a
+  # request left claimed is re-claimable once its lease lapses.
+  EXECUTION_REQUEST_DISPATCHER: "true"
+  # Policy checkpoint approvals backend (ADR 014; mctlhq/.github#181,
+  # mctl-gitops#1980), as on investigate. In this worker it backs the
+  # DevLoop's gated activities (a REQUIRE_APPROVAL action answers
+  # approval_pending and starts an ActionApprovalWaitWorkflow instead of being
+  # refused) and the in-process agent runs' mcp__mctl__* checkpoint.
+  # Authenticates with MCTL_TOKEN; needs mctl-agents >= 1.86.1. Must stay a
+  # literal (platform-gitops/governance/policy-checkpoint-coverage.yaml).
+  # Rollback: remove it (REQUIRE_APPROVAL then blocks) and mark the manifest
+  # entry governed: false with a tracked_by.
+  MCTL_POLICY_APPROVALS: mctl-api
+envFrom:
+  - secretRef:
+      name: mctl-agents-worker-secrets
+# Same Secret, mounted as a file so kubelet keeps it current. envFrom alone
+# cannot: a Secret update never propagates into an already-running process's
+# environment, only into a projected volume.
+extraVolumes:
+  - name: github-token
+    secret:
+      secretName: mctl-agents-worker-secrets
+      items:
+        - key: GITHUB_TOKEN
+          path: GITHUB_TOKEN
+extraVolumeMounts:
+  - name: github-token
+    mountPath: /var/run/secrets/github
+    readOnly: true
+# MCTL_TOKEN is the same static admin service token the Argo CWFT pods use
+# (Vault path secret/platform/mctl-agents, key mctl-token — see
+# platform-gitops/argo-workflows/secrets/mctl-agents-secrets.yaml) — this
+# worker calls the identical mctl-api operations-execute / workflows /
+# agents endpoints those pods' orchestrator code calls, just from a
+# long-running process instead of a per-run Argo pod.
+externalSecret:
+  # Platform-scoped paths — must use the cluster store; tenant-store only
+  # resolves secret/data/teams/admins/*.
+  store: vault-backend
+  storeKind: ClusterSecretStore
+  # 15m, not the 1h default: the GitHub App token this syncs lives 60 min, so
+  # an hourly refresh gives the mounted file zero margin — it could serve an
+  # already-expired token right up to the next sync.
+  refreshInterval: 15m
+  targetSecret: mctl-agents-worker-secrets
+  data:
+    - secretKey: MCTL_TOKEN
+      remoteKey: platform/mctl-agents
+      property: mctl-token
+    # The Claude Agent SDK authenticates from CLAUDE_CODE_OAUTH_TOKEN. Without
+    # it every agent run inside this worker ends as
+    # 'Not logged in · Please run /login' (apiKeySource: none) — observed on
+    # every incident-responder tick, and independent of the GitHub token fix
+    # above. The Argo CronWorkflow pods have always read this key from the same
+    # Vault path via mctl-agents-secrets in the argo-workflows namespace; the
+    # wiring was simply never added when issue-poll moved into this worker.
+    #
+    # Delivered via envFrom, so a rotation needs a pod restart to take effect.
+    # That is acceptable here (unlike the 60-min GitHub App token that needed
+    # GITHUB_TOKEN_FILE): this is a long-lived Pro/Max OAuth token, rotated by
+    # hand, not on a schedule.
+    - secretKey: CLAUDE_CODE_OAUTH_TOKEN
+      remoteKey: platform/mctl-agents
+      property: claude-code-oauth-token
+    - secretKey: GITHUB_TOKEN
+      remoteKey: platform/mctl-agent/tokens
+      property: github-token
+    # No GH_TOKEN here on purpose. The gh CLI gives GH_TOKEN precedence over
+    # GITHUB_TOKEN (verified in-pod: with both set, `gh auth status` reports
+    # "The token in GH_TOKEN is invalid"), so a frozen GH_TOKEN from pod start
+    # would shadow the GITHUB_TOKEN that github_token.py keeps refreshing and
+    # defeat the whole mechanism above. Nothing in orchestrator/ reads GH_TOKEN
+    # by name — gh picks up GITHUB_TOKEN on its own.
+
+# Bounded DevLoop rollout; other workflow types remain unsampled.
+# On: spans go to the permanent Tempo in `tracing` through the Collector
+# (#1280 verdict, docs/plans/tempo-adoption.md). One of the two producers
+# the soak covered and the owner re-enabled; set false to stop exporting.
+otel:
+  enabled: true

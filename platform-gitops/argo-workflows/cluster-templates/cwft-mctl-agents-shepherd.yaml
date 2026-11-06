@@ -1,0 +1,2015 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterWorkflowTemplate
+metadata:
+  name: mctl-agents-shepherd
+  annotations:
+    workflows.argoproj.io/description: |
+      Tier 3 — PR shepherd.
+
+      Drives implementer-opened PRs through to merge. Picks up every
+      proposal under platform-gitops/agents-state/<svc>/proposals/
+      whose .status.yaml is in {implemented, review-fixing} and has a
+      `pr:` URL, then runs the deterministic decide() state machine
+      from orchestrator/run_shepherd.py:
+
+        - wait              codex still pending or follow-up not landed
+        - address-review    codex P1/P2 findings exist on the head SHA;
+                            shepherd subprocess-invokes the Tier 2
+                            implementer with --review-feedback to push
+                            a follow-up commit on the existing branch
+                            (no new branch, no new PR), then flips
+                            .status.yaml to `review-fixing`
+        - merge             clean review + green CI; calls
+                            `gh pr merge --merge --delete-branch
+                            --match-head-commit <SHA>` and flips
+                            .status.yaml to `merged`
+        - flip-to-merged    PR was merged out of band by a human
+        - flip-to-rejected  PR was closed unmerged
+
+      There is no shared volume: each pod that needs the gitops checkout
+      SSH-clones it for itself in an initContainer, and cross-step state —
+      including the three values the onExit handler needs — travels as Argo
+      artifacts. See the "No PVC" note on spec.volumes (mctl-gitops#856).
+
+      Steps:
+        1. run-shepherd — orchestrator/run_shepherd inside
+           ghcr.io/mctlhq/mctl-agents:1.20.0. Reads STATE_DIR + GitHub
+           PAT, may invoke run_implementer as a subprocess for
+           address-review followups.
+        3. commit-and-push — commits any .status.yaml transitions back
+           to gitops main (implemented → review-fixing, review-fixing
+           → implemented after followup, → merged on successful merge,
+           → rejected on closed-unmerged), plus any adopted-prs/pr-<n>/
+           .prref.yaml records the run wrote. The `:(glob)` filter is
+           deliberately wider than the implementer template's — see
+           mctlhq/mctl-agents#334 (shepherd PR-adoption) and this
+           issue (mctl-gitops#1278) for why adoption records needed
+           the same durable-handoff path as .status.yaml.
+        4. post-deploy-verify — sleeps 300s, then lists ArgoCD
+           Applications that flipped to Health=Degraded since the run
+           started. A non-empty result fails the workflow, which
+           triggers the existing notify-telegram onExit handler with
+           the affected app names. Closes the gap exposed by the
+           external-secrets incident 2026-05-01 → 2026-05-07: the
+           shepherd would happily merge a PR that broke a downstream
+           Application and the merge would only surface 6 days later
+           when an operator noticed manually.
+
+      Triggered by:
+        - cron via CronWorkflow `mctl-agents-shepherd`
+          (every 30 min; suspended at install — operator un-suspends
+          after the first one-shot success)
+        - one-shot Workflow that references this CWFT via
+          workflowTemplateRef + clusterScope:true
+
+      NOT auto-triggered on .status.yaml changes (would require an
+      Argo Events Sensor — out of scope for v1).
+spec:
+  serviceAccountName: argo-workflow-sa
+  imagePullSecrets:
+    - name: ghcr-credentials
+  # Promtail maps these pod labels to the Loki `app` and `team` labels. Argo
+  # pods otherwise cannot be found through mctl_get_service_logs during an
+  # incident (incident-17841555) — cwft-mctl-agents-run.yaml has carried these
+  # since that incident; the rest of the agent templates did not, so their pods
+  # stayed invisible to log search. They also give NetworkPolicy a selector
+  # that picks out agent pods without catching platform workflows
+  # (deploy-service, create-tenant, ...) that share this namespace and do need
+  # in-cluster egress.
+  podMetadata:
+    labels:
+      app.kubernetes.io/name: mctl-agents
+      mctl.ai/team: admins
+  # 3d TTL — must outlive the new successfulJobsHistoryLimit (36) on
+  # cronworkflow-mctl-agents-shepherd at the `30 */2` cadence (12 ticks/d).
+  # Default 1d would prune workflows before the 3-day kept-window
+  # could fill (Codex P1 on PR #147).
+  ttlStrategy:
+    secondsAfterCompletion: 259200
+  # volumeClaimGC is gone with the PVC — there is no claim left to reclaim.
+  # Same 2h budget as the implementer: a single tick may invoke the
+  # implementer subprocess (clone sibling repo + Claude SDK + push) for
+  # every proposal that has unresolved P1/P2 findings.
+  activeDeadlineSeconds: 7200
+  entrypoint: shepherd-proposals
+  onExit: notify-telegram
+  # NB: the mctl-gitops-main-writes mutex used to live at workflow
+  # spec-level (per feedback_argo_shared_mutex.md) so the entire
+  # shepherd run held the lock from clone → push. After post-deploy-
+  # verify was added, that meant the 5-min reconcile sleep also held
+  # the global write lock and blocked unrelated `run`/`implement`
+  # workflows for no reason. Mutex now lives on the commit-and-push
+  # template only — that's the only step that actually writes to
+  # gitops main. Race-against-other-writers is still handled there
+  # by the existing 5×retry-with-rebase loop.
+
+  arguments:
+    parameters:
+      - name: service
+        value: ""
+        # Optional. When set, only proposals under that service's dir
+        # are evaluated. Validated by run_shepherd.py against
+        # config/settings.py SERVICES (exit 1 on mismatch).
+      - name: slug
+        value: ""
+        # Optional. When set, only that slug is evaluated (across
+        # services if `service` is empty too).
+      - name: dry_run
+        value: "false"
+        # When "true", run_shepherd evaluates decide() and prints the
+        # would-be transitions but does NOT invoke the implementer
+        # subprocess and does NOT call `gh pr merge`. Useful for
+        # operator dry runs and local smoke tests.
+      - name: agent_image
+        value: ghcr.io/mctlhq/mctl-agents:1.117.0
+        # Default = today's pin, so submitting without this parameter is a
+        # zero-behaviour-change no-op. Overridden by the agent registry's
+        # resolved image_ref once a caller starts pinning per-run.
+      - name: agent_version
+        value: ""
+        # Registry version string, carried for the record only — not
+        # consumed by run-shepherd. Left blank by any caller not yet
+        # using the registry.
+      - name: work_item_id
+        value: ""
+        # Optional. Canonical WorkItem id, minted by the caller (the
+        # dev-loop control plane). Correlation only — carried to the runner
+        # as env and NOT forwarded as a CLI flag: unlike
+        # cwft-mctl-agents-investigate.yaml, run_shepherd.py has no
+        # --work-item-id flag, so appending one would make argparse exit
+        # non-zero on every run, including the cron sweep. Empty means
+        # absent; no value is ever derived. Read by the usage producer
+        # (mctl-agents orchestrator/usage_ledger.py) beside the existing
+        # WORKFLOW_NAME join key. Mirrors gitops#1279; owner decision 4 of
+        # mctlhq/.github#50.
+      - name: execution_id
+        value: ""
+        # Optional. Execution identity for THIS attempt, minted by the same
+        # caller alongside work_item_id. Same correlation-only, env-not-argv,
+        # empty-means-absent rules as work_item_id above.
+      - name: temporal_workflow_id
+        value: ""
+        # Optional. Id of the DevLoopWorkflow that submitted this tick. Same
+        # correlation-only, env-not-argv, empty-means-absent rules as
+        # work_item_id above.
+      - name: temporal_run_id
+        value: ""
+        # Optional. Run id of that same DevLoopWorkflow. Same rules as
+        # temporal_workflow_id.
+      - name: execution_request_id
+        value: ""
+        # Optional. The mctl-api execution request (xr_...) this run
+        # fulfils, for correlation only: the execution identity is still
+        # execution_id. Same rules as work_item_id.
+
+  # ── No PVC ──────────────────────────────────────────────────────────────
+  # Was an 8Gi `volumeClaimTemplates` entry — and Hetzner rounds any request up
+  # to its 10Gi minimum, so every tick churned a 10Gi volume. The steps are
+  # separate pods spread across nodes, so that RWO volume had to move between
+  # them mid-run; a wedged detach leaves a pod Pending while it holds
+  # `mctl-gitops-main-writes`, which is the 2026-07-30 cascade and was proven
+  # on this very template's 12:00 tick on 2026-08-15 (mctl-gitops#856).
+  #
+  # Each pod now clones for itself and cross-step state travels as an Argo
+  # artifact — including the three values onExit needs, which is what used to
+  # make this template the hardest of the set to port.
+  volumes:
+    - name: workdir
+      emptyDir:
+        sizeLimit: 8Gi
+    - name: deploy-key
+      secret:
+        secretName: mctl-gitops-deploy-key
+        defaultMode: 0600
+    # See the same volume on cwft-mctl-agents-implement.yaml: a Secret
+    # volume is refreshed by kubelet independent of pod lifetime, unlike a
+    # plain env var fixed at pod start — needed because this template's
+    # 7200s activeDeadlineSeconds can outlive an installation token's
+    # ~60min TTL, and a single tick can walk many proposals. See
+    # GITHUB_TOKEN_FILE on run-shepherd below.
+    - name: github-token-file
+      secret:
+        secretName: mctl-agents-secrets
+        defaultMode: 0440
+        items:
+          - key: github-token
+            path: github-token
+
+  # No `outputs.parameters` here, and none on shepherd-proposals below. This
+  # template used to declare `degraded_apps` in both places purely so that
+  # notify-telegram's `{{workflow.outputs.parameters.degraded_apps}}` would
+  # pass Argo's static validator — without the declaration the CronWorkflow
+  # sat in `SpecError` and never scheduled (2026-05-06 21:00 → 2026-05-07).
+  #
+  # The whole mechanism is gone. Two separate failures killed it:
+  #
+  #   * 2026-07-06 — a SECOND entry sourced from a DIFFERENT step (`activity`
+  #     from `commit`) broke the static validator workflow-wide ("invalid
+  #     spec: templates.notify-telegram: failed to resolve
+  #     {{workflow.outputs.parameters.activity}}") even though each entry
+  #     resolved fine alone. Every tick failed and scheduling stopped. It was
+  #     reverted the same day, and the file has carried a one-slot budget ever
+  #     since.
+  #   * 2026-09-11 — the one remaining slot turned out not to work either.
+  #     Three runs recorded `degraded_apps: ""` in `status.outputs` and the
+  #     onExit pod, started 18s later, still got the raw `{{...}}` literal in
+  #     its env var, which notify-telegram's guard rendered as
+  #     "unknown (verification did not complete)" on three healthy runs
+  #     (gitops#1186).
+  #
+  # Every cross-step value onExit needs — shepherd_status, activity,
+  # verify_status + the degraded-app lists — now travels as an Argo ARTIFACT
+  # addressed by literal S3 key. That channel has neither limit, and it is
+  # what the three input artifacts on notify-telegram read.
+
+  templates:
+    - name: shepherd-proposals
+      steps:
+        # No `clone` step: with emptyDir there is no shared volume for one step
+        # to clone into on another's behalf.
+        - - name: shepherd
+            template: run-shepherd
+            arguments:
+              parameters:
+                - name: oauth-key
+                  value: claude-code-oauth-token
+                - name: is-fallback
+                  value: "false"
+            # run_shepherd writes .status.yaml updates (implemented →
+            # review-fixing, → merged, → rejected, → review-stuck)
+            # to the worktree BEFORE any failure that may crash the
+            # step. Without continueOn, Argo would skip commit-and-push
+            # on non-zero exit, those updates would never persist back
+            # to mctl-gitops main, and the next tick would reprocess
+            # the same proposal — duplicate merge attempts or repeated
+            # implementer subprocess calls. Letting commit run
+            # unconditionally makes the status durable; commit-and-push
+            # already handles the "no diff" case via
+            # `git diff --cached --quiet`.
+            #
+            # Both failed AND error: Argo distinguishes app-level
+            # non-zero exits (Failed) from pod-level errors like
+            # OOMKilled / deadline / controller errors (Error). Both
+            # can leave partial .status.yaml writes, so commit-and-push
+            # must run in either case.
+            continueOn:
+              failed: true
+              error: true
+        # Fallback retry on a SECOND Claude account, mirroring
+        # cwft-mctl-agents-run / -implement / -investigate: if the primary
+        # attempt did not succeed (most commonly the account-1 OAuth token
+        # hitting its five_hour/seven_day usage limit → HTTP 429), rerun the
+        # same scope on the account-2 token `claude-code-oauth-token-2`. If
+        # token-2 is not seeded the fallback fails (exit 1) so the run
+        # reports Failed instead of being masked as success.
+        - - name: shepherd-fallback
+            template: run-shepherd
+            when: "{{steps.shepherd.status}} != Succeeded"
+            arguments:
+              parameters:
+                - name: oauth-key
+                  value: claude-code-oauth-token-2
+                - name: is-fallback
+                  value: "true"
+            continueOn:
+              failed: true
+              error: true
+        - - name: commit
+            template: commit-and-push
+        - - name: verify
+            template: post-deploy-verify
+            arguments:
+              parameters:
+                - name: started_at
+                  # Workflow start timestamp — anything newer than this
+                  # crossed into Degraded *during* this shepherd run, so
+                  # is plausibly caused by a merge in step 3.
+                  value: "{{workflow.creationTimestamp}}"
+        # Truthful status. shepherd + shepherd-fallback run with continueOn so
+        # any .status.yaml transition they made before crashing is still
+        # committed — but that also means a crash (e.g. five_hour 429 on both
+        # accounts, or a bug in decide()) would otherwise leave the workflow
+        # GREEN with no proposal actually advanced. Until now the only signal
+        # was the shepherd_status artifact feeding the onExit Telegram/incident
+        # leg — a side channel notify-telegram reads, not something that
+        # fails the Argo workflow itself. Same assert-attempt pattern as
+        # cwft-mctl-agents-{run,investigate,implement}: fail unless at least
+        # one attempt actually succeeded. A genuine "nothing to shepherd this
+        # tick" run still has shepherd=Succeeded, so this never fails a
+        # legitimate no-op.
+        - - name: assert-produced
+            template: assert-attempt
+            arguments:
+              parameters:
+                - name: primary
+                  value: "{{steps.shepherd.status}}"
+                - name: fallback
+                  value: "{{steps.shepherd-fallback.status}}"
+
+
+    # ── 2. Run shepherd orchestrator ──────────────────────────────────────
+    # NB: 1.11.0 carries the read-merge-write update_status_yaml (preserves
+    # the `source` block on issue-driven proposals) and the generic
+    # implementer fallback used by the address-review subprocess for repos
+    # without an agents/<svc>/ scaffold. 1.10.0 shipped the dead-letter
+    # `in-progress` recovery (mctl-agents PR #13): discovery scope includes
+    # `in-progress` proposals; process_one gates on PR shape so Tier 2
+    # mid-flight is never raced — only CLOSED-unmerged PRs trigger the
+    # flip-to-rejected path. 1.9.0 was the first tag with the orchestrator.
+    - name: run-shepherd
+      # Least privilege: this step needs neither the Kubernetes API nor Vault.
+      # The pod runs as an identity with no role bindings and mounts no API
+      # token into the agent or clone containers; only Argo's own init/wait
+      # containers get the executor token, to report the step result. See
+      # config/sa-and-rbac.yaml. Template-level on purpose: the other steps
+      # keep the workflow-level account.
+      serviceAccountName: mctl-agents-runner
+      automountServiceAccountToken: false
+      executor:
+        serviceAccountName: mctl-agents-executor
+      # Restricted pod posture for the step that runs model-driven shell
+      # (mctl-gitops#1717). Template-level: the helper steps are root images.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      outputs:
+        artifacts:
+          # The `.status.yaml` flips and adopted-prs/pr-<n>/.prref.yaml records
+          # THIS attempt made, at repo-relative paths (mctlhq/mctl-agents#334,
+          # mctl-gitops#1278). Fixed workflow-scoped key, read literally by
+          # commit-and-push — one of the primary/fallback pair is always
+          # skipped and a step reference would not resolve (mctl-gitops#1042).
+          - name: changes
+            path: /tmp/state-out
+            optional: true
+            s3:
+              key: "{{workflow.name}}/agents-state.tgz"
+          # The onExit channel. `notify-telegram` used to read this off the
+          # shared PVC; an onExit pod gets its own emptyDir, so it had to
+          # become something node-independent.
+          #
+          # The PVC-era conservative default ("unknown" written by clone-gitops
+          # in case run-shepherd is OOMKilled before writing its own) is gone
+          # with the shared volume, and is not needed: an absent artifact and
+          # an absent file both land on notify-telegram's `|| echo "unknown"`
+          # fallback, which is the same outcome by a shorter path.
+          #
+          # An artifact rather than `workflow.outputs.parameters`: a second
+          # workflow output sourced from a DIFFERENT step is the bug that broke
+          # all three agent CronWorkflows on 2026-07-06 (#530/#531), and the
+          # one entry this file did keep did not resolve inside the exit
+          # handler anyway (gitops#1186). There are no output parameters left.
+          # Verified on a canary that an onExit template resolves an input
+          # artifact by literal S3 key — with the fallback skipped, with the
+          # fallback running, and with no producer at all (falls through to
+          # "unknown").
+          - name: shepherd-status
+            path: /tmp/onexit
+            optional: true
+            s3:
+              key: "{{workflow.name}}/onexit-shepherd-status.tgz"
+      initContainers:
+        # kube-router admits a new pod's IP into the proxy's ingress ipset a
+        # few seconds after the pod starts; a first connection inside that
+        # window is dropped (gitops#2164). Hold the pod until the proxy
+        # accepts a TCP connect, at most ~90s.
+        - name: wait-egress-proxy
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              for i in $(seq 1 30); do
+                nc -z -w 2 agent-egress-proxy.mctl-agents-egress.svc.cluster.local 3128 && exit 0
+                sleep 1
+              done
+              echo "agent-egress-proxy unreachable after ~90s" >&2
+              exit 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+        - name: clone-gitops
+          image: alpine/git:2.43.0
+          env:
+            - name: HTTPS_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: HTTP_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: https_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: http_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: NO_PROXY
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: no_proxy
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+              value: "1"
+          # Root on purpose: apk add + chown -R 1000:1000 /workdir hand-off
+          # (validate-local-workdir.py). Escalation is off and every capability
+          # except the file-ownership ones is dropped (mctl-gitops#1717).
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+          command: [sh, -c]
+          args:
+            - |
+              set -e
+              apk add --no-cache openssh-client ca-certificates socat
+              mkdir -p ~/.ssh
+              cp /secrets/deploy-key/ssh-privatekey ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  ProxyCommand socat - PROXY:agent-egress-proxy.mctl-agents-egress.svc.cluster.local:%%h:%%p,proxyport=3128\n  IdentityFile ~/.ssh/id_ed25519\n' > ~/.ssh/config
+              # GitHub's published SSH host keys, PINNED rather than trusted on
+              # first use. Source: https://api.github.com/meta (.ssh_keys),
+              # fetched 2026-09-02. This replaces StrictHostKeyChecking=no,
+              # which accepted whatever key answered on a connection that
+              # carries a WRITE-capable deploy key: a MITM or a DNS-poison of
+              # ssh.github.com was handed that key with no complaint.
+              #
+              # Keyed on [ssh.github.com]:443, not github.com. The Host block
+              # above rewrites hostname and port, and ssh looks up what it
+              # actually connects to — a github.com entry would silently miss.
+              #
+              # If GitHub rotates a host key these lines must be updated; it
+              # last happened in March 2023, when the RSA key was replaced.
+              cat > ~/.ssh/known_hosts <<'GITHUB_HOST_KEYS'
+              [ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+              [ssh.github.com]:443 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+              [ssh.github.com]:443 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+              GITHUB_HOST_KEYS
+              chmod 600 ~/.ssh/known_hosts
+              chmod 600 ~/.ssh/config
+              # Bounded retry. On 2026-11-04 10:54-11:16Z GitHub dropped SSH
+              # sessions right after the handshake (proxy tunnels were 200), every
+              # clone exited 128 and each failed run fanned out into an incident.
+              # Same key and URL on every try; git prints its own stderr.
+              for attempt in 1 2 3; do
+                if git clone --depth=1 git@github.com:mctlhq/mctl-gitops.git /workdir/mctl-gitops; then
+                  break
+                fi
+                rm -rf /workdir/mctl-gitops
+                if [ "$attempt" = 3 ]; then
+                  echo "clone-gitops: git clone failed after 3 attempts" >&2
+                  exit 128
+                fi
+                echo "clone-gitops: attempt $attempt failed, retrying" >&2
+                sleep $((attempt * 15))
+              done
+              mkdir -p /workdir/mctl-gitops/platform-gitops/agents-state
+              # Pre-create a PVC-backed scratch dir for the implementer
+              # subprocess's `gh repo clone` targets (address-review path).
+              # The orchestrator picks up `tempfile.gettempdir()` which
+              # honors TMPDIR — see run-shepherd env below. Without this,
+              # clones would land on the pod's ephemeral storage and the
+              # 8Gi PVC sizing would be ineffective for multi-repo runs.
+              mkdir -p /workdir/clones
+              # uid 1000 is the mctl-agents image USER (SOC F8). This clone step
+              # runs as root in alpine/git; without the handoff the next step
+              # cannot write STATE_DIR or TMPDIR.
+              chown -R 1000:1000 /workdir
+              echo "✓ gitops cloned"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi, ephemeral-storage: 8Gi }
+            limits:   { cpu: 500m, memory: 256Mi, ephemeral-storage: 9Gi }
+          volumeMounts:
+            - name: workdir
+              mountPath: /workdir
+            - name: deploy-key
+              mountPath: /secrets/deploy-key
+      inputs:
+        parameters:
+          # Which Vault key under mctl-agents-secrets holds the OAuth token
+          # for this attempt. Primary step passes claude-code-oauth-token;
+          # the fallback step passes claude-code-oauth-token-2 (a second
+          # account). Same convention as cwft-mctl-agents-run.
+          - name: oauth-key
+            value: claude-code-oauth-token
+          # "true" only for the fallback retry: fail loudly if token-2 is
+          # absent instead of masking the double-failure as success.
+          - name: is-fallback
+            value: "false"
+      container:
+        image: "{{workflow.parameters.agent_image}}"
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        imagePullPolicy: IfNotPresent
+        command: ["/entrypoint.sh"]
+        args:
+          - "sh"
+          - "-c"
+          - |
+            set -e
+            # FIRST, before any branch that writes into it. /tmp/onexit is the
+            # onExit channel, collected as an `optional: true` artifact — and
+            # the fallback-token guard just below writes `failed` into it and
+            # exits. With `set -e` active and the directory missing, that write
+            # itself fails and the status is never recorded, so onExit reports
+            # "unknown" instead of "failed": the exact bug this template's
+            # `set +e` fix exists to remove, relocated one branch earlier
+            # (claude P1 on gitops#1048).
+            mkdir -p /tmp/onexit
+
+            # Fallback-token guard, mirroring cwft-mctl-agents-run's
+            # run-orchestrator: on the account-2 retry an unseeded token-2
+            # (empty env via optional:true below) must fail non-zero so the
+            # run reports Failed instead of being masked as success. A
+            # missing PRIMARY token still fails loudly at SDK auth.
+            if [ "$IS_FALLBACK" = "true" ]; then
+              if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+                echo "❌ Primary attempt failed and no fallback token (claude-code-oauth-token-2) is set — cannot fall back." >&2
+                echo -n "failed" > /tmp/onexit/shepherd_status
+                exit 1
+              fi
+              echo "↻ Primary attempt did not succeed — retrying on fallback OAuth token (account 2)."
+            fi
+            # Wire git's HTTPS credential helper to the same
+            # GITHUB_TOKEN gh CLI uses. Without this, `gh repo clone`
+            # succeeds (it speaks to the API directly) but the
+            # implementer subprocess's later `git push -u origin
+            # <branch>` falls through to interactive auth and fails
+            # with "could not read Username for 'https://github.com'".
+            # `gh auth setup-git` installs `gh auth git-credential` as
+            # the credential helper, which reads GITHUB_TOKEN from the
+            # env at push time. Skip silently if no token.
+            if [ -s "$GITHUB_TOKEN_FILE" ]; then
+              GITHUB_TOKEN="$(cat "$GITHUB_TOKEN_FILE")" gh auth setup-git
+            fi
+            # Read params from env, NOT inline workflow.parameters
+            # (Argo template syntax) interpolation: a value like
+            # `; rm -rf /` would otherwise be spliced straight into
+            # the shell command. Build argv via `set --` so each flag
+            # / value pair is a separate, properly quoted token.
+            set -- python -m orchestrator.run_shepherd
+            if [ -n "$WORKFLOW_SERVICE" ]; then
+              set -- "$@" --service "$WORKFLOW_SERVICE"
+            fi
+            if [ -n "$WORKFLOW_SLUG" ]; then
+              set -- "$@" --slug "$WORKFLOW_SLUG"
+            fi
+            if [ "$WORKFLOW_DRY_RUN" = "true" ]; then
+              set -- "$@" --dry-run
+            fi
+            printf '→'
+            printf ' %s' "$@"
+            printf '\n'
+            # NOT `exec` — the parent step has continueOn.failed/error:true,
+            # so a run-shepherd crash here is swallowed by the workflow's
+            # overall status and a later Succeeded commit-and-push +
+            # post-deploy-verify can leave WORKFLOW_STATUS=Succeeded even
+            # though this attempt's own merge/review-fix never actually
+            # completed (Codex P1 on PR #613, round 3). Capturing the real
+            # exit code to the shepherd_status artifact lets notify-telegram
+            # tell a masked run-shepherd failure apart from a genuine clean
+            # run — same pattern as poller_status on cwft-mctl-agents-
+            # issue-poll's run-poller.
+            # `set +e` around the attempt, and it is load-bearing rather than
+            # stylistic. `set -e` is active from line 1, so a bare `"$@"` that
+            # fails aborts the script IMMEDIATELY — `RC=$?` and the
+            # shepherd_status write below never run. The comment above has
+            # claimed since PR #613 that capturing the exit code lets
+            # notify-telegram tell a masked run-shepherd failure from a clean
+            # run; it could not, because on the failure path the file was never
+            # written and onExit fell through to "unknown". Verified with a
+            # one-line probe: under `set -e`, the statement after a failing
+            # command does not execute. Same shape as run-orchestrator and
+            # run-investigator, which already wrap their attempt this way.
+            set +e
+            "$@"
+            RC=$?
+            set -e
+            if [ "$RC" -eq 0 ]; then
+              echo -n "succeeded" > /tmp/onexit/shepherd_status
+            else
+              echo -n "failed" > /tmp/onexit/shepherd_status
+            fi
+
+            # Collect the `.status.yaml` flips for commit-and-push. Deliberately
+            # after the status write above and before the exit, so a failed
+            # attempt still hands off what it managed to change — the shared PVC
+            # used to give that for free.
+            python - "$RC" <<'COLLECT'
+            import os
+            import re
+            import shutil
+            import subprocess
+            import sys
+
+            ROOT = "/workdir/mctl-gitops"
+            OUT = "/tmp/state-out"
+            TREE = os.path.join(OUT, "tree")
+            DELETED = os.path.join(OUT, "deleted.lst")
+            # Widened for mctl-agents#334 (shepherd PR-adoption) / mctl-gitops#1278:
+            # an adoption record at agents-state/<svc>/adopted-prs/pr-<n>/.prref.yaml
+            # is now as legitimate a handoff as a .status.yaml flip.
+            ALLOWED = re.compile(
+                r"^platform-gitops/agents-state/(?:.+/\.status\.yaml"
+                r"|[^/]+/adopted-prs/pr-[0-9]+/\.prref\.yaml)$"
+            )
+            PATHSPECS = [
+                ":(glob)platform-gitops/agents-state/**/.status.yaml",
+                ":(glob)platform-gitops/agents-state/*/adopted-prs/*/**",
+            ]
+            rc = int(sys.argv[1])
+
+            # Cleared HERE, after the agent has exited, and owned by this script alone.
+            # The agent holds Bash in this container, so a reset before it ran would let
+            # it plant a directory that Argo then uploads as the handoff. The invariant is
+            # stated once: this directory exists at exit iff this script filled it.
+            shutil.rmtree(OUT, ignore_errors=True)
+
+            raw = subprocess.run(
+                ["git", "-C", ROOT, "status", "--porcelain=v1", "-z", "-uall", "--", *PATHSPECS],
+                capture_output=True, check=True).stdout
+
+
+            def _text(b):
+                return b.decode("utf-8", "surrogateescape")
+
+
+            # porcelain -z is NOT one record per NUL-separated field. A rename or copy is
+            # emitted as `XY new\0old\0` — the status prefix is on the FIRST field only, so
+            # slicing [3:] off every field chops three real characters off the old path
+            # (claude P2 on #1046). Walk the fields with an index and consume the extra one.
+            fields = [f for f in raw.split(b"\x00") if f != b""]
+            copies, deletions = [], []
+            i = 0
+            while i < len(fields):
+                entry = fields[i]
+                i += 1
+                status = _text(entry[:2])
+                path = _text(entry[3:])
+                # Both status columns, matching cwft-mctl-agents-run and
+                # -investigate. A plain `mv` produces no rename entry at all
+                # (measured: `" D old"` + `"?? new"`), so the Y column is not
+                # reachable in practice here — but a missed pair would desync the
+                # NUL walk for every entry after it, and that fails silently.
+                if "R" in status or "C" in status:
+                    if i >= len(fields):
+                        sys.stderr.write("malformed rename entry: missing original path\n")
+                        sys.exit(1)
+                    original = _text(fields[i])
+                    i += 1
+                    # A rename removes the old path; a copy leaves it in place.
+                    if "R" in status:
+                        deletions.append(original)
+                src = os.path.join(ROOT, path)
+                if os.path.islink(src):
+                    print("skipping %s (symlink)" % path)
+                    continue
+                # A path git reports that no longer exists on disk is a DELETION, and it
+                # has to travel too: commit-and-push lays this handoff over a fresh clone,
+                # which is purely additive, so a removal the agent made would otherwise
+                # never reach main (claude P1 on #1046).
+                (copies if os.path.isfile(src) else deletions).append(path)
+
+            bad = [
+                p for p in copies + deletions
+                if not ALLOWED.match(p) or ".." in p.split("/") or any(c in p for c in "\n\r\t")
+            ]
+            if bad:
+                sys.stderr.write("refusing to hand off paths outside the allowed subtree:\n")
+                for p in bad:
+                    sys.stderr.write("  %r\n" % p)
+                sys.exit(1)
+
+            if not copies and not deletions:
+                print("nothing to hand off")
+                sys.exit(rc)
+
+            os.makedirs(TREE, exist_ok=True)
+            for rel in copies:
+                dst = os.path.join(TREE, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                # follow_symlinks=False, and it is a secret-leak guard rather than
+                # tidiness. The islink() check happens in the classification loop
+                # above and the copy here — two passes — and the SDK agent can leave
+                # a background process alive past its own exit, so a path checked as
+                # a regular file can be a symlink by the time it is copied. copy2
+                # DEREFERENCES by default, so that would read the target — e.g. the
+                # GitHub token mounted at /var/run/gh — and land its contents in the
+                # handoff as an ORDINARY FILE, which commit-and-push's `! -type f`
+                # check then cannot tell from a legitimate one, and it reaches main.
+                # Copying the LINK keeps it a symlink, which that check does catch
+                # (agy P1 on gitops#1048).
+                shutil.copy2(os.path.join(ROOT, rel), dst, follow_symlinks=False)
+                print("handing off %s" % rel)
+
+            # Newline-separated is unambiguous here precisely because the check above
+            # already refused any path carrying a control character.
+            if deletions:
+                with open(DELETED, "w", encoding="utf-8") as fh:
+                    for rel in deletions:
+                        fh.write(rel + "\n")
+                        print("handing off DELETION of %s" % rel)
+
+            sys.exit(rc)
+            COLLECT
+        env:
+          - name: HTTPS_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: HTTP_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: https_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: http_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: NO_PROXY
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: no_proxy
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            value: "1"
+          # Workflow params injected as env vars so the shell layer
+          # can quote them safely. Direct `workflow.parameters.*`
+          # (Argo template syntax) interpolation in the script body
+          # is a shell-injection vector.
+          - name: WORKFLOW_SERVICE
+            value: "{{workflow.parameters.service}}"
+          - name: WORKFLOW_SLUG
+            value: "{{workflow.parameters.slug}}"
+          - name: WORKFLOW_DRY_RUN
+            value: "{{workflow.parameters.dry_run}}"
+          - name: IS_FALLBACK
+            value: "{{inputs.parameters.is-fallback}}"
+          # Same STATE_DIR layout as cwft-mctl-agents-run /
+          # cwft-mctl-agents-implement — entrypoint.sh symlinks
+          # <state>/<svc>/proposals onto /app/agents/<svc>/proposals/
+          # so the SDK sees them, and run_shepherd reads them
+          # directly.
+          - name: STATE_DIR
+            value: /workdir/mctl-gitops/platform-gitops/agents-state
+          # Redirect Python's `tempfile.gettempdir()` (used by the
+          # implementer subprocess for `gh repo clone` targets) onto
+          # the PVC so each clone lands in PVC-backed storage — not
+          # the pod's ephemeral filesystem. clone-gitops creates this
+          # dir; if it doesn't exist Python's mkstemp / mkdtemp will
+          # error.
+          - name: TMPDIR
+            value: /workdir/clones
+          # Auth: OAuth (Claude Pro/Max). Key is parameterized: primary uses
+          # claude-code-oauth-token, the fallback step uses
+          # claude-code-oauth-token-2. optional:true lets the fallback pod
+          # schedule when token-2 is absent (the guard script then exits 1);
+          # a missing PRIMARY token still fails loudly at SDK auth.
+          - name: CLAUDE_CODE_OAUTH_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: "{{inputs.parameters.oauth-key}}"
+                optional: true
+          # GitHub PAT for `gh api`, `gh pr merge`, and the
+          # implementer subprocess's `gh repo clone` + `gh pr create`
+          # calls. PAT must have repo write scope on mctlhq/*.
+          # Marked optional: a local smoke run without GITHUB_TOKEN
+          # can still exercise the discovery path (--dry-run).
+          # Path to the mounted Secret volume (see spec.volumes above).
+          # refresh_github_token() re-reads GITHUB_TOKEN from this file
+          # before every gh/git subprocess, so a tick that outlives the
+          # token's ~60min TTL still authenticates correctly. There is no
+          # GITHUB_TOKEN env seed (#2288): the file is the only delivery.
+          - name: GITHUB_TOKEN_FILE
+            value: /var/run/gh/github-token
+          # Optional MCP token, same convention as the run + implement
+          # pipelines.
+          - name: MCTL_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: mctl-token
+                optional: true
+          # Policy checkpoint approvals backend (ADR 014; mctlhq/.github#181,
+          # mctl-gitops#1980), as on investigate: a non-read mcp__mctl__* call
+          # creates or redeems a durable approval request in mctl-api instead
+          # of being blocked outright. Authenticates with MCTL_TOKEN; needs
+          # mctl-agents >= 1.86.1. Must stay a literal (see
+          # platform-gitops/governance/policy-checkpoint-coverage.yaml).
+          # Today this changes no decision here: the shepherd's model session
+          # has no MCP server, its own merges are ALLOW, and an agent-definition
+          # merge decides with NO_APPROVALS whatever this says (run_shepherd.py,
+          # per-tick execution ids). It makes the approval store the default
+          # for any future REQUIRE_APPROVAL checkpoint in this pod.
+          # Rollback: remove it (REQUIRE_APPROVAL then blocks) and mark the
+          # manifest entry governed: false with a tracked_by.
+          - name: MCTL_POLICY_APPROVALS
+            value: mctl-api
+          # Usage-writer token (mctlhq/.github#50): the only credential the
+          # usage producer may use to append this run's model-usage records
+          # to mctl-api. It may do nothing else there. Optional: absent (the
+          # default until the owner provisions it) the producer logs once and
+          # records nothing; the run itself is unaffected.
+          - name: MCTL_USAGE_WRITER_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: usage-writer-token
+                optional: true
+          # Bearer token of the evidence-writer principal (mctlhq/mctl-agents#199,
+          # ADR 018): the producer posts one sealed execution-evidence envelope
+          # per governed run to mctl-api and may do nothing else there.
+          # Optional and never fatal: absent, the producer logs once and posts
+          # nothing; the run itself is unaffected.
+          - name: MCTL_EVIDENCE_WRITER_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: evidence-writer-token
+                optional: true
+          # ADR 018 Amendment 2 blocks (versions, subject, tool_calls,
+          # provenance). mctl-api accepts them since 4.66.0 (mctl-api#473).
+          - name: MCTL_EVIDENCE_AMENDMENT_2
+            value: "true"
+          # The Argo run name, the join key of this run's usage records to
+          # its agent_executions row (argo_workflow_name). Read by nothing
+          # else in this runner.
+          - name: WORKFLOW_NAME
+            value: "{{workflow.name}}"
+          # Optional Temporal / WorkItem correlation (gitops#1408, mirroring
+          # gitops#1279 on cwft-mctl-agents-investigate.yaml). Read by the
+          # usage producer (mctl-agents orchestrator/usage_ledger.py) next to
+          # WORKFLOW_NAME above; NOT consumed by run_shepherd's argv, which
+          # has no such flags. The shepherd's in-pod implementer subprocess
+          # (review-fixing path) inherits this env too, so no separate
+          # threading is needed there. Empty for every caller that does not
+          # set them. Enforced by
+          # scripts/validate-shell-param-interpolation.py: these names are in
+          # neither its BASELINE nor its CONSTRAINED set, so interpolating
+          # them into the script body instead of env would fail CI.
+          - name: WORKFLOW_WORK_ITEM_ID
+            value: "{{workflow.parameters.work_item_id}}"
+          - name: WORKFLOW_EXECUTION_ID
+            value: "{{workflow.parameters.execution_id}}"
+          - name: WORKFLOW_TEMPORAL_WORKFLOW_ID
+            value: "{{workflow.parameters.temporal_workflow_id}}"
+          - name: WORKFLOW_TEMPORAL_RUN_ID
+            value: "{{workflow.parameters.temporal_run_id}}"
+          - name: WORKFLOW_EXECUTION_REQUEST_ID
+            value: "{{workflow.parameters.execution_request_id}}"
+          # Per-tick budget cap. Tier 3 spec sets the default to
+          # $1.00 per tick; we bump to $5.00 here to absorb worst-case
+          # ticks that drive multiple proposals through the
+          # address-review subprocess in the same run. Every-30-min
+          # cadence (48 ticks/day) caps daily cost at $240 worst case;
+          # in practice most ticks find nothing to do and exit free.
+          - name: SHEPHERD_BUDGET_USD
+            value: "5.00"
+          # Ownership is split by STAGE, not by repo (mctl-agents#292).
+          #
+          # fix-only: the shepherd discovers, reviews and pushes follow-up
+          # commits, but decide() returns defer-merge instead of merge, so the
+          # merge decision stays with the other PR lifecycle (pr-steward in
+          # mctl-claude-remote). This is what gives a steward-owned repo a path
+          # from a blocking review finding back to code — before it existed, a
+          # steward-owned repo could be told what was wrong and had nothing
+          # that could fix it.
+          #
+          # skip: discovered by nothing. Reserved for repos where even a
+          # follow-up commit from an agent is not wanted.
+          #
+          # The code for this shipped in mctl-agents#341 on 2026-09-11 and has
+          # been dark ever since, because this value was never set: every
+          # steward-owned repo stayed in SKIP, so the review-feedback path
+          # #292 added was unreachable in production. mctlhq/mctl-gitops#1073
+          # is the standing evidence — blocking findings since 2026-09-09 and
+          # no actor able to address them.
+          #
+          # Values are the ones the approved #292 proposal specifies
+          # (agents-state/mctl-agents/proposals/issue-292-.../tasks.md task 9).
+          #
+          # mctl-academy stays in SKIP and is the reason the two lists are not
+          # redundant: it is skipped by the shepherd AND absent from the
+          # steward's repo list, so nothing auto-merges it at all. Academy's
+          # clean-room content policy makes human CODEOWNER approval the last
+          # check before a question publishes. It is additionally hardened in
+          # code (NEVER_MERGE_SERVICES), which caps it at fix-only so no value
+          # here can ever resolve it to full. Do not "fix" the asymmetry by
+          # adding it to the steward.
+          #
+          # Both lists are comma/space-separated and read at import. A service
+          # named in both resolves to fix-only, so the two edits below are
+          # order-independent.
+          #
+          # 2026-10-29: mctl-design, mctl-telegram and mctl-pairdesk moved from
+          # fix-only to full. Their merge path belonged to pr-steward in
+          # labs/claude-remote, which is paused (replicaCount 0, #2247), so
+          # their feat/agents-* PRs would otherwise sit green with no actor
+          # able to merge them. The shepherd merges with --merge, which
+          # mctl-telegram requires (it forbids squash). mctl-gitops stays
+          # fix-only: it is also in NEVER_MERGE_SERVICES, so no value here
+          # could resolve it to full. Move these three back to fix-only
+          # before claude-remote's steward is re-enabled, or the two
+          # lifecycles race on the merge again (mctl-telegram#730).
+          - name: SHEPHERD_FIX_ONLY_SERVICES
+            value: "mctl-gitops"
+          - name: SHEPHERD_SKIP_SERVICES
+            value: "mctl-academy"
+          # How long run_implementer --review-feedback waits for an
+          # asynchronously launched `implementer` sub-agent to reach a
+          # terminal status before giving up with exit 46
+          # (EXIT_ORPHANED_SUBAGENT). This is a sub-deadline INSIDE one
+          # follow-up, not the run's wall-clock budget -- that is the 7200s
+          # activeDeadlineSeconds at the top of this file. Before
+          # mctl-agents#366 the driver stopped reading at the first
+          # ResultMessage, which ends a TURN and not the RUN, so an
+          # async-launched sub-agent was abandoned mid-work and the shepherd
+          # charged the proposal a review attempt for the harness's own loss.
+          # Pinned at orchestrator/options.py's default so the knob exists in
+          # the cluster; raise it only if orphan exits start appearing on
+          # sub-agents that were in fact still making progress.
+          - name: IMPLEMENTER_DRAIN_TIMEOUT_SECONDS
+            value: "300"
+        resources:
+          # memory 8Gi: the shepherd forks run_implementer.py
+          # --review-feedback in the same pod, which runs the target repo's
+          # `go build` sanity check — that plus the SDK process OOMKilled a
+          # 4Gi container (see cwft-mctl-agents-implement).
+          requests: { cpu: 200m, memory: 1Gi, ephemeral-storage: 8Gi }
+          limits:   { cpu: 2000m, memory: 8Gi, ephemeral-storage: 9Gi }
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+          - name: github-token-file
+            mountPath: /var/run/gh
+            readOnly: true
+
+    # ── 3. Commit & push back to mctl-gitops ──────────────────────────────
+    # .status.yaml files (run_shepherd writes them after each proposal
+    # transition) and adopted-prs/pr-<n>/.prref.yaml adoption records
+    # (mctlhq/mctl-agents#334, mctl-gitops#1278) are the only things that
+    # should change in agents-state/. Defensive: stage only that subtree.
+    - name: commit-and-push
+      inputs:
+        artifacts:
+          # The `.status.yaml` flips whichever attempt ran handed off, unpacked
+          # here and copied over this pod's OWN fresh clone. Literal S3 key, not
+          # a step reference: one of the primary/fallback pair is always skipped.
+          - name: changes
+            path: /artifact
+            optional: true
+            s3:
+              key: "{{workflow.name}}/agents-state.tgz"
+      outputs:
+        artifacts:
+          # The onExit channel for `activity`. notify-telegram used to read this
+          # off the shared PVC; an onExit pod gets its own emptyDir, so it
+          # travels as an artifact addressed by literal key instead. NOT a
+          # `workflow.outputs.parameters` entry — a second one sourced from a
+          # different step is the bug that broke all three agent CronWorkflows
+          # on 2026-07-06 (#530/#531), and the last remaining one was removed
+          # in gitops#1186 for not resolving inside the exit handler.
+          - name: activity
+            path: /tmp/onexit
+            optional: true
+            s3:
+              key: "{{workflow.name}}/onexit-activity.tgz"
+      initContainers:
+        # kube-router admits a new pod's IP into the proxy's ingress ipset a
+        # few seconds after the pod starts; a first connection inside that
+        # window is dropped (gitops#2164). Hold the pod until the proxy
+        # accepts a TCP connect, at most ~90s.
+        - name: wait-egress-proxy
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              for i in $(seq 1 30); do
+                nc -z -w 2 agent-egress-proxy.mctl-agents-egress.svc.cluster.local 3128 && exit 0
+                sleep 1
+              done
+              echo "agent-egress-proxy unreachable after ~90s" >&2
+              exit 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+        - name: clone-gitops
+          image: alpine/git:2.43.0
+          env:
+            - name: HTTPS_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: HTTP_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: https_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: http_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: NO_PROXY
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: no_proxy
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+              value: "1"
+          command: [sh, -c]
+          args:
+            - |
+              set -e
+              apk add --no-cache openssh-client ca-certificates socat
+              mkdir -p ~/.ssh
+              cp /secrets/deploy-key/ssh-privatekey ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  ProxyCommand socat - PROXY:agent-egress-proxy.mctl-agents-egress.svc.cluster.local:%%h:%%p,proxyport=3128\n  IdentityFile ~/.ssh/id_ed25519\n' > ~/.ssh/config
+              # GitHub's published SSH host keys, PINNED rather than trusted on
+              # first use. Source: https://api.github.com/meta (.ssh_keys),
+              # fetched 2026-09-02. This replaces StrictHostKeyChecking=no,
+              # which accepted whatever key answered on a connection that
+              # carries a WRITE-capable deploy key: a MITM or a DNS-poison of
+              # ssh.github.com was handed that key with no complaint.
+              #
+              # Keyed on [ssh.github.com]:443, not github.com. The Host block
+              # above rewrites hostname and port, and ssh looks up what it
+              # actually connects to — a github.com entry would silently miss.
+              #
+              # If GitHub rotates a host key these lines must be updated; it
+              # last happened in March 2023, when the RSA key was replaced.
+              cat > ~/.ssh/known_hosts <<'GITHUB_HOST_KEYS'
+              [ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+              [ssh.github.com]:443 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+              [ssh.github.com]:443 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+              GITHUB_HOST_KEYS
+              chmod 600 ~/.ssh/known_hosts
+              chmod 600 ~/.ssh/config
+              # Bounded retry. On 2026-11-04 10:54-11:16Z GitHub dropped SSH
+              # sessions right after the handshake (proxy tunnels were 200), every
+              # clone exited 128 and each failed run fanned out into an incident.
+              # Same key and URL on every try; git prints its own stderr.
+              for attempt in 1 2 3; do
+                if git clone --depth=1 git@github.com:mctlhq/mctl-gitops.git /workdir/mctl-gitops; then
+                  break
+                fi
+                rm -rf /workdir/mctl-gitops
+                if [ "$attempt" = 3 ]; then
+                  echo "clone-gitops: git clone failed after 3 attempts" >&2
+                  exit 128
+                fi
+                echo "clone-gitops: attempt $attempt failed, retrying" >&2
+                sleep $((attempt * 15))
+              done
+              mkdir -p /workdir/mctl-gitops/platform-gitops/agents-state
+              echo "✓ gitops cloned (fresh checkout, never touched by the agent)"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi, ephemeral-storage: 8Gi }
+            limits:   { cpu: 500m, memory: 256Mi, ephemeral-storage: 9Gi }
+          volumeMounts:
+            - name: workdir
+              mountPath: /workdir
+            - name: deploy-key
+              mountPath: /secrets/deploy-key
+      # mctl-gitops-main-writes was hoisted to template-level here
+      # (down from spec-level) so the rest of the shepherd run —
+      # clone, run-shepherd, the 5-min post-deploy-verify sleep —
+      # no longer holds the global write lock. Other workflows that
+      # share this mutex (cwft-mctl-agents-run, -implement) only
+      # contend during the actual `git push` window, not for the
+      # entire 1-2 minutes a shepherd tick may take.
+      synchronization:
+        mutex:
+          name: mctl-gitops-main-writes
+      # Writes activity ("yes"/"none") for notify-telegram, handed over as an
+      # Argo ARTIFACT addressed by literal S3 key — NOT via output parameters,
+      # see the note above `templates:` for why this file has none.
+      script:
+        image: alpine/git:2.43.0
+        command: [sh]
+        env:
+          - name: HTTPS_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: HTTP_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: https_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: http_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: NO_PROXY
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: no_proxy
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            value: "1"
+          # Workflow params injected as env vars so the shell layer
+          # can quote them safely. Direct `workflow.parameters.*`
+          # (Argo template syntax) interpolation in the script body
+          # is a shell-injection vector — and this pod has the gitops
+          # deploy key + push access to main, so a crafted
+          # `service` / `slug` value could escalate from a malformed
+          # param into arbitrary git operations against mctl-gitops.
+          - name: WORKFLOW_SERVICE
+            value: "{{workflow.parameters.service}}"
+          - name: WORKFLOW_SLUG
+            value: "{{workflow.parameters.slug}}"
+        source: |
+          set -e
+          apk add --no-cache openssh-client ca-certificates socat
+          mkdir -p ~/.ssh
+          cp /secrets/deploy-key/ssh-privatekey ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  ProxyCommand socat - PROXY:agent-egress-proxy.mctl-agents-egress.svc.cluster.local:%%h:%%p,proxyport=3128\n  IdentityFile ~/.ssh/id_ed25519\n' > ~/.ssh/config
+          # GitHub's published SSH host keys, PINNED rather than trusted on
+          # first use. Source: https://api.github.com/meta (.ssh_keys),
+          # fetched 2026-09-02. This replaces StrictHostKeyChecking=no,
+          # which accepted whatever key answered on a connection that
+          # carries a WRITE-capable deploy key: a MITM or a DNS-poison of
+          # ssh.github.com was handed that key with no complaint.
+          #
+          # Keyed on [ssh.github.com]:443, not github.com. The Host block
+          # above rewrites hostname and port, and ssh looks up what it
+          # actually connects to — a github.com entry would silently miss.
+          #
+          # If GitHub rotates a host key these lines must be updated; it
+          # last happened in March 2023, when the RSA key was replaced.
+          cat > ~/.ssh/known_hosts <<'GITHUB_HOST_KEYS'
+          [ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          [ssh.github.com]:443 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          [ssh.github.com]:443 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          GITHUB_HOST_KEYS
+          chmod 600 ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/config
+
+          # This worktree came from THIS pod's own initContainer clone — the SDK
+          # agent has never touched it. That is the point (gitops#983 P1): git
+          # executes repository-supplied config and hooks, this container runs as
+          # root, and the write-capable deploy key is mounted here.
+          #
+          # `safe.directory` goes with the shared volume: it existed only because
+          # the old clone step chowned /workdir to uid 1000 for the agent (incident
+          # 2026-08-14 23:02). Nothing chowns this checkout, so git's ownership
+          # check stays armed. `git reset -q origin/main` goes too, along with the
+          # whole rationale above it — a pristine clone has no agent-staged index
+          # and no agent commit to unwind.
+          cd /workdir/mctl-gitops
+          git config user.name "mctl-agents[bot]"
+          git config user.email "mctl-agents[bot]@users.noreply.github.com"
+
+          # The two pathspecs this step will ever stage or exclude, plus the
+          # equivalent regex for validating a handoff's file list — kept as
+          # single named values so each expression appears exactly once in
+          # this script. Widened for mctlhq/mctl-agents#334 (shepherd
+          # PR-adoption) / mctl-gitops#1278: an adopted-prs/pr-<n>/.prref.yaml
+          # record is as legitimate a commit target as a .status.yaml flip.
+          PATH_STATUS='platform-gitops/agents-state/**/.status.yaml'
+          PATH_ADOPTED='platform-gitops/agents-state/*/adopted-prs/*/**'
+          SPEC_STATUS=":(glob)${PATH_STATUS}"
+          SPEC_ADOPTED=":(glob)${PATH_ADOPTED}"
+          EXCL_STATUS=":(exclude,glob)${PATH_STATUS}"
+          EXCL_ADOPTED=":(exclude,glob)${PATH_ADOPTED}"
+          ALLOWED_RE='^platform-gitops/agents-state/(.+/\.status\.yaml|[^/]+/adopted-prs/pr-[0-9]+/\.prref\.yaml)$'
+
+          # /tmp/onexit is the onExit channel, collected as an optional artifact.
+          #
+          # Besides `activity` it carries two files post-deploy-verify and
+          # notify-telegram read:
+          #   merged          — "yes" when a .status.yaml in this commit flips
+          #                     to merged, "no" when it provably does not, and
+          #                     "unknown" (the seed) on any path that exits
+          #                     before deciding. Only "no" lets post-deploy-verify
+          #                     skip; a refused handoff stays "unknown" and is
+          #                     verified as before.
+          #   transitions.txt — one "<status> <path>" line per terminal flip
+          #                     (merged / rejected / review-stuck), the only
+          #                     outcomes a succeeded tick reports to Telegram.
+          mkdir -p /tmp/onexit
+          printf %s unknown > /tmp/onexit/merged
+          : > /tmp/onexit/transitions.txt
+
+          if [ ! -d /artifact ] \
+             || { [ -z "$(find /artifact/tree -type f -print -quit 2>/dev/null)" ] \
+                  && [ ! -s /artifact/deleted.lst ]; }; then
+            echo "ℹ️  No agents-state updates handed off — nothing to commit."
+            echo -n "none" > /tmp/onexit/activity
+            printf %s no > /tmp/onexit/merged
+            exit 0
+          fi
+
+          # Validate the handoff BEFORE any of it touches the checkout. This, not the
+          # git-status guard below, is the boundary that matters: `git status` cannot
+          # see inside `.git/`, so a file smuggled to `.git/hooks/pre-commit` would be
+          # invisible to it and would run as root with the deploy key mounted on the
+          # next git command (agy P1 on gitops#1042).
+          if [ -n "$(find /artifact -mindepth 1 ! -type d ! -type f -print -quit)" ]; then
+            echo "❌ Refusing a handoff containing a symlink or special file:" >&2
+            find /artifact -mindepth 1 ! -type d ! -type f >&2
+            exit 1
+          fi
+          BAD="$(cd /artifact/tree 2>/dev/null && find . -type f | sed 's|^\./||' | grep -vE "$ALLOWED_RE" || true)"
+          if [ -n "$BAD" ]; then
+            echo "❌ Refusing a handoff with paths outside the allowed agents-state subtree:" >&2
+            printf '%s\n' "$BAD" >&2
+            exit 1
+          fi
+          if [ -s /artifact/deleted.lst ]; then
+            BAD_DEL="$(grep -vE "$ALLOWED_RE" /artifact/deleted.lst || true)"
+            if [ -n "$BAD_DEL" ]; then
+              echo "❌ Refusing a deletion list with paths outside the allowed agents-state subtree:" >&2
+              printf '%s\n' "$BAD_DEL" >&2
+              exit 1
+            fi
+          fi
+
+          if [ -d /artifact/tree/platform-gitops/agents-state ]; then
+            mkdir -p /workdir/mctl-gitops/platform-gitops/agents-state
+            cp -a /artifact/tree/platform-gitops/agents-state/. /workdir/mctl-gitops/platform-gitops/agents-state/
+          fi
+          # Deletions travel explicitly: the copy above overlays onto a FRESH clone and
+          # is purely additive. `:(literal)` because $rel is a git PATHSPEC and a name
+          # carrying `*` would glob onto its neighbours (claude+agy P1 on gitops#1046).
+          if [ -s /artifact/deleted.lst ]; then
+            while IFS= read -r rel; do
+              [ -n "$rel" ] || continue
+              git rm -q --ignore-unmatch -- ":(literal)$rel"
+              echo "removed ${rel}"
+            done < /artifact/deleted.lst
+          fi
+
+          # Second layer, on the checkout: the same expressions the PVC era used, now
+          # against a pristine clone holding only what the copy above laid down. Both
+          # exclude pathspecs must be passed together — without SPEC_ADOPTED here, a
+          # .prref.yaml the copy above laid down would trip this guard as an
+          # unexpected change and fail the whole commit step.
+          NON_STATUS_CHANGES="$(git status --porcelain -z -uall -- "$EXCL_STATUS" "$EXCL_ADOPTED" | tr '\0' '\n' | cut -c4-)"
+          if [ -n "$NON_STATUS_CHANGES" ]; then
+            echo "❌ Refusing to commit changes outside the allowed agents-state subtree:" >&2
+            printf '%s\n' "$NON_STATUS_CHANGES" >&2
+            exit 1
+          fi
+
+          AGENT_STATE_CHANGES="$(git status --porcelain -z -uall -- "$SPEC_STATUS" "$SPEC_ADOPTED" | tr '\0' '\n' | cut -c4-)"
+          if [ -z "$AGENT_STATE_CHANGES" ]; then
+            echo "ℹ️  No agents-state updates — nothing to commit."
+            echo -n "none" > /tmp/onexit/activity
+            printf %s no > /tmp/onexit/merged
+            exit 0
+          fi
+
+          # `git add` with a pathspec that matches nothing exits 128 under `set -e`,
+          # so only pass the pathspecs that actually have something left to add.
+          #
+          # "has changes" is NOT the same test: the `git rm` loop above has
+          # already staged its deletions, and `git status` keeps reporting them
+          # (`D `) while the paths are gone from both the index and the worktree.
+          # Handing such a pathspec to `git add` therefore matches nothing and
+          # exits 128, killing commit-and-push under `set -e` — losing the whole
+          # durable write, not just the deletion (agy P2 on gitops#1295). A
+          # deletion staged by `git rm` needs no `git add` at all, so a pathspec
+          # is only worth passing when something that is not an already-staged
+          # deletion is waiting for it.
+          needs_add() {
+            git status --porcelain -z -uall -- "$1" | tr '\0' '\n' | grep -qv '^D '
+          }
+
+          set --
+          if needs_add "$SPEC_STATUS"; then
+            set -- "$@" "$SPEC_STATUS"
+          fi
+          if needs_add "$SPEC_ADOPTED"; then
+            set -- "$@" "$SPEC_ADOPTED"
+          fi
+          if [ "$#" -gt 0 ]; then
+            git add -- "$@"
+          fi
+
+          if git diff --cached --quiet; then
+            # Defensive: AGENT_STATE_CHANGES already proved there are
+            # matches, but keep this guard in case `git add` ever
+            # ends up staging an empty diff (e.g. a permissions-only
+            # change git ignores).
+            echo "ℹ️  No status updates after staging — nothing to commit."
+            echo -n "none" > /tmp/onexit/activity
+            printf %s no > /tmp/onexit/merged
+            exit 0
+          fi
+
+          # Written before the commit and push, not after: the merge already
+          # happened on GitHub inside run-shepherd, so a push that fails below
+          # must not make this tick look merge-free to post-deploy-verify.
+          record_transitions() {
+            git diff --cached -U0 -- "$SPEC_STATUS" \
+              | awk '/^\+\+\+ b\//{p=substr($0,7)} /^\+status:/{print $2, p}' \
+              | tr -d "\"'" \
+              | grep -E '^(merged|rejected|review-stuck) ' > /tmp/onexit/transitions.txt || true
+            if grep -q '^merged ' /tmp/onexit/transitions.txt; then
+              printf %s yes > /tmp/onexit/merged
+            else
+              printf %s no > /tmp/onexit/merged
+            fi
+          }
+          record_transitions
+
+          DATE=$(date -u +%Y-%m-%d)
+          if [ -n "$WORKFLOW_SLUG" ]; then
+            MSG="chore(agents): shepherd ${WORKFLOW_SLUG} ${DATE}"
+          elif [ -n "$WORKFLOW_SERVICE" ]; then
+            MSG="chore(agents): shepherd ${WORKFLOW_SERVICE} ${DATE}"
+          else
+            MSG="chore(agents): shepherd run ${DATE}"
+          fi
+          git commit -m "$MSG"
+
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              echo "✅ Pushed status updates"
+              echo -n "yes" > /tmp/onexit/activity
+              exit 0
+            fi
+            echo "⚠️  Push failed (attempt ${i}), rebasing..."
+            # Guarded: `set -e` is active, so an unguarded failure here —
+            # a rebase conflict, a transient network error — kills the
+            # script on the FIRST retry instead of trying the remaining
+            # attempts, and the "failed after 5 attempts" line never prints
+            # (agy P3 on gitops#982). Abort a half-applied rebase so the
+            # next iteration starts from a clean worktree.
+            if ! git pull --rebase origin main; then
+              git rebase --abort 2>/dev/null || true
+              echo "⚠️  Rebase failed (attempt ${i}); retrying" >&2
+            fi
+          done
+          echo "❌ Push failed after 5 attempts"
+          exit 1
+        # No resources were declared on this step at all — it was unbounded
+        # on cpu and memory as well as on disk. ephemeral-storage matters
+        # most: the workdir is an emptyDir now, so an unaccounted pod can
+        # pack onto a node beside vault and shared-pg and push it into
+        # DiskPressure.
+        resources:
+          requests: { cpu: 50m, memory: 64Mi, ephemeral-storage: 8Gi }
+          limits:   { cpu: 500m, memory: 256Mi, ephemeral-storage: 9Gi }
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+          - name: deploy-key
+            mountPath: /secrets/deploy-key
+
+    # ── 4. Post-deploy verify ──────────────────────────────────────────────
+    # Run AFTER commit-and-push has flushed every .status.yaml transition
+    # to gitops main. Sleeps the ArgoCD reconcile budget, then asks the
+    # API for any Application that crossed into Health=Degraded after
+    # this workflow started. A non-empty list = the shepherd plausibly
+    # merged a PR that broke a downstream app — fail the workflow so
+    # notify-telegram fires with the bad-app names. No auto-revert in v1
+    # (operator looks at the alert and decides; auto-revert is a v2
+    # follow-up that needs commit-SHA → owning-app correlation).
+    #
+    # kubectl retry policy: 3 attempts × 5s backoff. A single transient
+    # API-server hiccup is absorbed; persistent failures (missing RBAC,
+    # missing CRD, broken auth) escalate to exit 1 so the operator
+    # notices that the safeguard itself is broken — silently bypassing
+    # would defeat the entire purpose of this step.
+    #
+    # Everything this step tells onExit travels on the artifact channel:
+    # verify_status (clean / degraded / kubectl-failed), the filtered
+    # degraded-app list, and the unfiltered snapshot. See the artifact
+    # block below for why none of it is a workflow output parameter.
+    - name: post-deploy-verify
+      initContainers:
+        # kube-router admits a new pod's IP into the proxy's ingress ipset a
+        # few seconds after the pod starts; a first connection inside that
+        # window is dropped (gitops#2164). Hold the pod until the proxy
+        # accepts a TCP connect, at most ~90s.
+        - name: wait-egress-proxy
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              for i in $(seq 1 30); do
+                nc -z -w 2 agent-egress-proxy.mctl-agents-egress.svc.cluster.local 3128 && exit 0
+                sleep 1
+              done
+              echo "agent-egress-proxy unreachable after ~90s" >&2
+              exit 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+      inputs:
+        parameters:
+          - name: started_at
+        artifacts:
+          # Whether this tick merged anything, and whether the shepherd attempt
+          # itself finished. Same literal keys notify-telegram reads; both
+          # optional, and an absent file reads as "unknown", which verifies.
+          - name: activity
+            path: /onexit/commit
+            optional: true
+            s3:
+              key: "{{workflow.name}}/onexit-activity.tgz"
+          - name: shepherd-status
+            path: /onexit/shepherd
+            optional: true
+            s3:
+              key: "{{workflow.name}}/onexit-shepherd-status.tgz"
+      outputs:
+        artifacts:
+          # The onExit channel for every signal this step produces. Same
+          # reasoning as `activity` on commit-and-push: an onExit pod gets its
+          # own emptyDir, so a file has to travel as an artifact addressed by
+          # literal S3 key.
+          #
+          # `degraded_apps` used to travel as a `globalName` output parameter
+          # read back in notify-telegram as
+          # `{{workflow.outputs.parameters.degraded_apps}}`. That resolution
+          # is not reliable inside an exit handler: on 2026-09-11 three runs
+          # (d6c4ded3, 94ea75cf, 4f1402b6) recorded the global correctly in
+          # `status.outputs` — `{"name":"degraded_apps","value":""}` — and the
+          # onExit pod, started 18s later, still received the raw
+          # `{{...}}` literal in its env var. notify-telegram's guard against
+          # raw template syntax then rendered it as
+          # "unknown (verification did not complete)" and stapled a false
+          # post-deploy-verify warning onto three healthy runs (gitops#1186).
+          # The parameter channel is gone; this artifact is the whole
+          # interface now.
+          - name: verify-signals
+            path: /tmp/onexit
+            optional: true
+            s3:
+              key: "{{workflow.name}}/onexit-degraded.tgz"
+      script:
+        image: alpine/k8s:1.33.12
+        command: [bash]
+        env:
+          - name: HTTPS_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: HTTP_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: https_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: http_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: NO_PROXY
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: no_proxy
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            value: "1"
+          - name: STARTED_AT
+            value: "{{inputs.parameters.started_at}}"
+        source: |
+          set -uo pipefail
+
+          # Write the onExit files FIRST, before anything that can fail, so a
+          # step that dies mid-flight still hands onExit a truthful state.
+          #
+          # `verify_status` is seeded PESSIMISTICALLY as "incomplete" and
+          # promoted to "clean" only by the last line of this script. Seeding
+          # it "clean" would be this same bug one layer down: the wait
+          # container uploads output artifacts for a FAILED pod too, so a step
+          # OOMKilled during the 300s sleep — or tripped by a jq error on
+          # malformed kubectl output — would ship a "clean" verdict it never
+          # reached, and onExit would stay silent about the safeguard on a
+          # workflow that failed (agy P2 on gitops#1187). An absent file reads
+          # as "incomplete" for the same reason, so the two unreachable paths
+          # agree.
+          mkdir -p /tmp/onexit
+          printf 'incomplete' > /tmp/onexit/verify_status
+          : > /tmp/onexit/degraded.txt
+          : > /tmp/onexit/degraded_unfiltered.txt
+
+          # Verify only a tick that may have merged something. Before this,
+          # every tick slept 300s and then failed on ANY app that went Degraded
+          # after the workflow started, merge or not: on 2026-10-23 about 60
+          # ticks failed in nine hours, each blaming a flapping
+          # argocd/labs-mctl-telegram on a run that had only addressed review
+          # comments. Skipping needs both facts positively: commit-and-push
+          # recorded merged=no AND the shepherd attempt reported succeeded. A
+          # missing file, "unknown", or a crashed attempt (which may have
+          # merged before it died) all verify exactly as before.
+          MERGED=$(cat /onexit/commit/merged 2>/dev/null || echo "unknown")
+          SHEPHERD_STATUS=$(cat /onexit/shepherd/shepherd_status 2>/dev/null || echo "unknown")
+          SKIP_VERIFY=""
+          if [ "$MERGED" = "no" ] && [ "$SHEPHERD_STATUS" = "succeeded" ]; then
+            SKIP_VERIFY=1
+            echo "No merge this tick (merged=no, shepherd=succeeded) — skipping the post-merge wait and Degraded check."
+          else
+            echo "merged=${MERGED} shepherd=${SHEPHERD_STATUS} — verifying."
+            # 5-min sleep ≈ ArgoCD's default app reconcile interval (180s)
+            # plus a buffer for the per-resource health re-evaluation pass
+            # that runs on the next tick after a sync.
+            echo "Sleeping 300s for ArgoCD to reconcile post-merge…"
+            sleep 300
+          fi
+
+          # The unfiltered snapshot gates incident resolution in onExit, so a
+          # skipped verification still has to produce it. See the note at the
+          # end of this script.
+          write_unfiltered() {
+            printf '%s' "$1" | jq -r '
+              .items[]
+              | select(.status.health.status == "Degraded")
+              | "\(.metadata.namespace)/\(.metadata.name)"
+            ' | tr '\n' ' ' > /tmp/onexit/degraded_unfiltered.txt
+          }
+
+          THRESHOLD="${STARTED_AT}"
+          echo "Listing applications that became Degraded after ${THRESHOLD}…"
+
+          # Retry kubectl up to 3× to ride out transient API-server
+          # hiccups. After 3 failures, treat as persistent and fail the
+          # step — silently bypassing on missing RBAC / CRD / broken
+          # auth would defeat the safeguard.
+          #
+          # Scope is `-n argocd`, NOT `-A`: argo-workflow-sa is bound
+          # via a namespaced RoleBinding in the `argocd` namespace
+          # (platform-gitops/argo-workflows/config/sa-and-rbac.yaml,
+          # lines 73-100). A cluster-wide list would 403 on every
+          # retry. All ArgoCD Applications live in `argocd` anyway.
+          RAW=""
+          RC=1
+          for attempt in 1 2 3; do
+            set +e
+            RAW=$(kubectl get applications.argoproj.io -n argocd -o json 2>/dev/null)
+            RC=$?
+            set -e
+            if [ "$RC" -eq 0 ] && [ -n "$RAW" ]; then
+              break
+            fi
+            echo "⚠️  kubectl get applications attempt ${attempt}/3 failed (rc=$RC)"
+            [ "$attempt" -lt 3 ] && sleep 5
+          done
+          if [ "$RC" -ne 0 ] || [ -z "$RAW" ]; then
+            echo "❌ kubectl get applications failed 3× — persistent failure, not absorbing."
+            printf 'kubectl-failed' > /tmp/onexit/verify_status
+            echo "kubectl-failed (rc=$RC)" > /tmp/onexit/degraded.txt
+            exit 1
+          fi
+
+          if [ -n "$SKIP_VERIFY" ]; then
+            write_unfiltered "$RAW"
+            printf 'skipped' > /tmp/onexit/verify_status
+            exit 0
+          fi
+
+          # Compare timestamps as epoch seconds, not strings.
+          # Lexical RFC3339 comparison breaks on fractional-second
+          # boundaries: "2026-05-06T23:14:30.5Z" sorts BEFORE
+          # "2026-05-06T23:14:30Z" because "." (0x2E) < "Z" (0x5A) in
+          # bytewise order. fromdateiso8601 truncates to integer
+          # epoch seconds — same precision on both sides. Empty / null
+          # lastTransitionTime defaults to 0 so unparsed apps never
+          # match the threshold (treated as "before workflow start").
+          BAD=$(printf '%s' "$RAW" | jq -r --arg ts "$THRESHOLD" '
+            ($ts | fromdateiso8601) as $threshold
+            | .items[]
+            | select(.status.health.status == "Degraded")
+            | select(((.status.health.lastTransitionTime // "1970-01-01T00:00:00Z") | fromdateiso8601) > $threshold)
+            | "\(.metadata.namespace)/\(.metadata.name)"
+          ' | tr '\n' ' ')
+
+          if [ -n "$BAD" ]; then
+            echo "⚠️  Newly Degraded apps detected: $BAD — waiting 120s to confirm (rolling-update grace)…"
+            sleep 120
+            RAW2=$(kubectl get applications.argoproj.io -n argocd -o json 2>/dev/null) || RAW2=""
+            BAD2=""
+            if [ -n "$RAW2" ]; then
+              BAD2=$(printf '%s' "$RAW2" | jq -r --arg ts "$THRESHOLD" '
+                ($ts | fromdateiso8601) as $threshold
+                | .items[]
+                | select(.status.health.status == "Degraded")
+                | select(((.status.health.lastTransitionTime // "1970-01-01T00:00:00Z") | fromdateiso8601) > $threshold)
+                | "\(.metadata.namespace)/\(.metadata.name)"
+              ' | tr '\n' ' ')
+            fi
+            if [ -n "$BAD2" ]; then
+              echo "❌ Still Degraded after 120s grace: $BAD2"
+              echo "Threshold (workflow.creationTimestamp): $THRESHOLD"
+              printf 'degraded' > /tmp/onexit/verify_status
+              printf '%s' "$BAD2" > /tmp/onexit/degraded.txt
+              exit 1
+            fi
+            echo "✓ Apps recovered within grace period (transient rolling-update): $BAD"
+          fi
+          echo "✓ No persistent Degraded apps detected after shepherd run."
+
+          # Unfiltered snapshot (no lastTransitionTime threshold) of every
+          # currently-Degraded app, using the freshest kubectl read we have
+          # (post-grace RAW2 if the 120s grace check ran, else RAW). This
+          # step can pass above purely because a Degraded app's transition
+          # predates THIS run's threshold — that app would never show up
+          # in $BAD/$BAD2 again even though it never recovered. onExit
+          # uses this unfiltered list, not the filtered degraded.txt, to
+          # decide whether it's safe to resolve the shepherd fingerprint.
+          FRESH="${RAW2:-$RAW}"
+          write_unfiltered "$FRESH"
+
+          # Last line of the script, deliberately: everything above this
+          # point can fail, and until it is reached the verdict stays
+          # "incomplete".
+          printf 'clean' > /tmp/onexit/verify_status
+
+    # ── 4b. Assert at least one attempt succeeded ───────────────────────────
+    # Same shape as cwft-mctl-agents-investigate's assert-attempt: receives
+    # both step statuses as parameters and fails iff neither is "Succeeded".
+    # Omitted steps resolve to "Omitted" (when shepherd succeeds, the
+    # fallback is skipped) — harmless, the primary clause already passes.
+    - name: assert-attempt
+      inputs:
+        parameters:
+          - name: primary
+          - name: fallback
+      script:
+        image: alpine:3.19
+        command: [sh]
+        env:
+          - name: PARAM_PRIMARY
+            value: "{{inputs.parameters.primary}}"
+          - name: PARAM_FALLBACK
+            value: "{{inputs.parameters.fallback}}"
+        source: |
+          PRIMARY="$PARAM_PRIMARY"
+          FALLBACK="$PARAM_FALLBACK"
+          echo "shepherd attempt: ${PRIMARY:-<none>}   fallback attempt: ${FALLBACK:-<none>}"
+          if [ "$PRIMARY" = "Succeeded" ] || [ "$FALLBACK" = "Succeeded" ]; then
+            echo "✓ An attempt succeeded — workflow status reflects real work."
+            exit 0
+          fi
+          echo "❌ Neither the primary attempt nor the account-2 fallback succeeded — no proposal was actually advanced this tick." >&2
+          echo "   Most often the Claude five_hour usage limit / HTTP 429 on both accounts, or token-2 unset." >&2
+          echo "   Any partial .status.yaml transition was still committed — check the shepherd_status artifact via the" >&2
+          echo "   onExit Telegram alert for the specific failure. Re-run once quota resets." >&2
+          exit 1
+
+    # ── 5. Telegram notification (onExit) ──────────────────────────────────
+    # Same pattern as cwft-mctl-agents-run / cwft-mctl-agents-implement.
+    - name: notify-telegram
+      initContainers:
+        # kube-router admits a new pod's IP into the proxy's ingress ipset a
+        # few seconds after the pod starts; a first connection inside that
+        # window is dropped (gitops#2164). Hold the pod until the proxy
+        # accepts a TCP connect, at most ~90s.
+        - name: wait-egress-proxy
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              for i in $(seq 1 30); do
+                nc -z -w 2 agent-egress-proxy.mctl-agents-egress.svc.cluster.local 3128 && exit 0
+                sleep 1
+              done
+              echo "agent-egress-proxy unreachable after ~90s" >&2
+              exit 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+      inputs:
+        artifacts:
+          # Everything this onExit handler needs, each addressed by its own
+          # literal S3 key. onExit pods get their own emptyDir, so the
+          # shared-PVC files these used to read are gone; and
+          # `workflow.outputs.parameters` is not an alternative here — a
+          # second entry sourced from a different step is the 2026-07-06 bug
+          # (#530/#531), and the single remaining entry turned out not to
+          # resolve inside an exit handler either (gitops#1186). See the note
+          # above `templates:` for both.
+          #
+          # `optional: true` on all three: an attempt that never ran, or
+          # crashed before writing, simply leaves the object absent and the
+          # missing-file fallbacks below take over — which is exactly how
+          # "verification did not complete" is now detected, instead of being
+          # inferred from unresolved template syntax. Verified on a canary that
+          # an onExit template resolves these keys with the producing step
+          # skipped, with a fallback producing instead, and with no producer at
+          # all.
+          - name: shepherd-status
+            path: /onexit/shepherd
+            optional: true
+            s3:
+              key: "{{workflow.name}}/onexit-shepherd-status.tgz"
+          - name: activity
+            path: /onexit/commit
+            optional: true
+            s3:
+              key: "{{workflow.name}}/onexit-activity.tgz"
+          - name: verify-signals
+            path: /onexit/verify
+            optional: true
+            s3:
+              key: "{{workflow.name}}/onexit-degraded.tgz"
+      script:
+        image: alpine:3.19
+        command: [sh]
+        env:
+          - name: HTTPS_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: HTTP_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: https_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: http_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: NO_PROXY
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: no_proxy
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            value: "1"
+          - name: TG_BOT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: telegram-bot-token
+                optional: true
+          - name: TG_CHAT_ID
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: telegram-chat-id
+                optional: true
+          - name: MCTL_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: mctl-token
+                optional: true
+          # Workflow params + status injected as env vars so the
+          # shell layer can quote them safely. Even though this is
+          # just a notification step, raw `workflow.parameters.*`
+          # (Argo template syntax) interpolation is still arbitrary
+          # command execution in a workflow pod.
+          - name: WORKFLOW_STATUS
+            value: "{{workflow.status}}"
+          # Identifies which CWFT this onExit handler belongs to — used to
+          # namespace the incident fingerprint below so run/implement/shepherd
+          # failures never collide with each other.
+          - name: WORKFLOW_TEMPLATE_KIND
+            value: "shepherd"
+          - name: WORKFLOW_SERVICE
+            value: "{{workflow.parameters.service}}"
+          - name: WORKFLOW_SLUG
+            value: "{{workflow.parameters.slug}}"
+          # Same param/env-var naming as run-shepherd's WORKFLOW_DRY_RUN —
+          # used below to keep a dry_run=true run (decide()-only, no
+          # merge/review-fix subprocess) from resolving a REAL incident for
+          # the same scope (Codex P2 on PR #613, round 3).
+          - name: WORKFLOW_DRY_RUN
+            value: "{{workflow.parameters.dry_run}}"
+          - name: WORKFLOW_NAME
+            value: "{{workflow.name}}"
+          - name: WORKFLOW_DURATION
+            value: "{{workflow.duration}}"
+        source: |
+          set +e
+          apk add --no-cache curl ca-certificates jq >/dev/null 2>&1
+
+          # "none" when commit-and-push had nothing to commit (steady-state
+          # hourly tick with no proposal transitions). Read from the artifact
+          # mounted at /onexit/commit rather than a workflow output parameter
+          # — see the note above `templates:` for why this file has none.
+          WORKFLOW_ACTIVITY=$(cat /onexit/commit/activity 2>/dev/null || echo "unknown")
+
+          # post-deploy-verify's own verdict, and the app list behind it. Both
+          # come off the same artifact the step wrote before it could fail, so
+          # "verify ran and found nothing" and "verify never got there" are
+          # now two different readings instead of one ambiguous empty string:
+          #
+          #   clean          — ran to the end, no newly-Degraded app survived
+          #                    the grace period
+          #   degraded       — ran, apps still Degraded; list in degraded.txt
+          #   kubectl-failed — ran, could not read Applications 3× in a row
+          #   skipped        — the tick merged nothing, so there was nothing
+          #                    to verify; degraded_unfiltered.txt is still
+          #                    written
+          #   incomplete     — the step was killed or errored out before its
+          #                    last line, or the file is absent entirely
+          #
+          # This replaces reading the degraded_apps workflow output parameter
+          # from an env var. That resolution silently handed this script the raw
+          # template literal on runs where the global was recorded correctly, and
+          # the guard against raw syntax then reported three healthy runs as
+          # "unknown (verification did not complete)" (gitops#1186). NB: do not
+          # write that template expression out in full anywhere inside a script
+          # body — `argo lint` resolves tags in rendered script text too, and an
+          # explanatory mention is indistinguishable from a real reference.
+          VERIFY_STATUS=$(cat /onexit/verify/verify_status 2>/dev/null || echo "incomplete")
+          WORKFLOW_DEGRADED_APPS=$(cat /onexit/verify/degraded.txt 2>/dev/null || echo "")
+
+          # Unfiltered (no time-threshold) snapshot of currently-Degraded
+          # apps, written by post-deploy-verify. Empty means the cluster is
+          # fully healthy; non-empty means at least one app is Degraded
+          # RIGHT NOW even if it's not "newly" so per this run's threshold.
+          # Used below to gate fingerprint resolution — see the note on
+          # post-deploy-verify for the false-resolve scenario this closes
+          # (Codex P1 on PR #613).
+          WORKFLOW_DEGRADED_APPS_UNFILTERED=$(cat /onexit/verify/degraded_unfiltered.txt 2>/dev/null || echo "")
+
+          # run-shepherd's own truthful exit status ("succeeded"/"failed"/
+          # "unknown") — NOT the same thing as WORKFLOW_STATUS. The
+          # shepherd-proposals DAG runs run-shepherd with
+          # continueOn.failed/error, so a run-shepherd crash followed by a
+          # successful commit-and-push + post-deploy-verify still leaves
+          # WORKFLOW_STATUS=Succeeded even though the shepherd attempt
+          # itself never completed. See run-shepherd for where this is
+          # written.
+          SHEPHERD_STATUS=$(cat /onexit/shepherd/shepherd_status 2>/dev/null || echo "unknown")
+
+          # Terminal proposal flips this tick committed, "<status> <path>" per
+          # line (see commit-and-push). Rendered as "<status>: <service>/<slug>".
+          TRANSITIONS=$(sed -E \
+            -e 's#platform-gitops/agents-state/##' \
+            -e 's#/proposals/#/#' \
+            -e 's#/\.status\.yaml$##' \
+            -e 's#^([a-z-]+) #\1: #' \
+            /onexit/commit/transitions.txt 2>/dev/null)
+
+          # Stable dedup key for this recurring job. Two failures of the same
+          # {service, slug} scope collapse into one open incident instead of
+          # a fresh one per tick; a differing service/slug still gets its own.
+          FINGERPRINT="workflow_failed:${WORKFLOW_TEMPLATE_KIND}:${WORKFLOW_SERVICE}:${WORKFLOW_SLUG}"
+
+          case "$WORKFLOW_STATUS" in
+            Succeeded) ICON="✅" ;;
+            Failed)    ICON="❌" ;;
+            Error)     ICON="⚠️" ;;
+            *)         ICON="⏳" ;;
+          esac
+          if [ -n "$WORKFLOW_SLUG" ]; then
+            SUBJECT="shepherd ${WORKFLOW_SLUG}"
+          elif [ -n "$WORKFLOW_SERVICE" ]; then
+            SUBJECT="shepherd ${WORKFLOW_SERVICE}"
+          else
+            SUBJECT="shepherd (all open PRs)"
+          fi
+          UI_URL="https://workflows.mctl.ai/workflows/argo-workflows/${WORKFLOW_NAME}"
+          # Built with printf so the separator is a REAL newline. It used to be
+          # a literal `\n` inside a double-quoted string, which worked only
+          # because the payload below was assembled by shell interpolation
+          # straight into a JSON string literal, where `\n` IS the escape.
+          # Encoding the body with jq (as it now is) escapes that backslash,
+          # so the message would have shown a literal `\n` instead of a line
+          # break — a regression introduced by the jq fix itself, caught in
+          # review (claude P2 on gitops#1048). cwft-mctl-agents-investigate's
+          # equivalent leg has always used printf for this reason.
+          TEXT=$(printf '%s mctl-agents: %s — %s (%ss)\n%s' \
+            "$ICON" "$SUBJECT" "$WORKFLOW_STATUS" "$WORKFLOW_DURATION" "$UI_URL")
+          # One note, built once, used by both the Telegram leg and the
+          # incident leg below so they can never disagree.
+          #
+          # `clean` says nothing: an all-clear that prints a ⚠️ line is how
+          # this channel started crying wolf in the first place. `incomplete`
+          # says nothing on a Succeeded workflow either — `verify` runs with
+          # no continueOn and writes `clean` on its last line, so a Succeeded
+          # workflow with anything else here is an artifact-upload hiccup, not
+          # a verification outcome. It IS worth a line on a Failed/Error run,
+          # where "the safeguard did not finish" is exactly what the operator
+          # needs to know, and is now a fact rather than the inference the old
+          # unresolved-parameter guard was making.
+          VERIFY_NOTE=""
+          case "$VERIFY_STATUS" in
+            degraded|kubectl-failed)
+              # The verify step writes either "kubectl-failed (rc=N)" or the
+              # space-separated list of namespace/name pairs. Both cases are
+              # operator-relevant — surface verbatim.
+              VERIFY_NOTE="post-deploy-verify flagged: ${WORKFLOW_DEGRADED_APPS}"
+              ;;
+            incomplete)
+              if [ "$WORKFLOW_STATUS" != "Succeeded" ]; then
+                VERIFY_NOTE="post-deploy-verify did not complete"
+              fi
+              ;;
+          esac
+          if [ -n "$VERIFY_NOTE" ]; then
+            TEXT=$(printf '%s\n⚠️ %s' "$TEXT" "$VERIFY_NOTE")
+          fi
+          if [ -n "$TRANSITIONS" ]; then
+            TEXT=$(printf '%s\n%s' "$TEXT" "$TRANSITIONS")
+          fi
+
+          # Telegram leg. A Succeeded run reports only a terminal outcome —
+          # merged, rejected or review-stuck — so each PR produces one message
+          # when it is done instead of one per tick. Skipping on
+          # activity=none alone was not enough: a proposal in review-fixing
+          # commits a .status.yaml update on every tick, and 2026-10-19..24
+          # carried four ✅ per PR (issue-64, -74, -781, -1979) that said
+          # nothing but "still working". Failed/Error/Unknown (incl. a
+          # post-deploy-verify degraded-apps failure) always notify.
+          if [ "$WORKFLOW_STATUS" = "Succeeded" ] && [ -z "$TRANSITIONS" ]; then
+            echo "ℹ️  Succeeded with no terminal transition (activity=${WORKFLOW_ACTIVITY}) — skipping Telegram leg."
+          elif [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            # JSON-encoded with jq, not shell interpolation. $TEXT carries the
+            # slug, the service name and the degraded-app list, so a double
+            # quote or a backslash in any of them produced malformed JSON, the
+            # API answered 400, and the alert was dropped — visible only as an
+            # http= line in a log nobody reads, with the step still green
+            # (agy P2 on gitops#1048). The incident leg below has always built
+            # its body this way, and so does cwft-mctl-agents-investigate; this
+            # leg was the odd one out.
+            TG_BODY=$(jq -nc --arg chat "$TG_CHAT_ID" --arg text "$TEXT" \
+              '{chat_id: $chat, text: $text, disable_web_page_preview: true}')
+            curl -s -o /dev/null -w 'telegram http=%{http_code}\n' \
+              -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$TG_BODY"
+          else
+            echo "ℹ️  TG_BOT_TOKEN or TG_CHAT_ID not set; skipping Telegram leg."
+          fi
+
+          # Incident leg — only on terminal failure/success. See B6 G3 in
+          # ~/.claude/plans/mctl-agents-daily-cron-visibility.md for why
+          # cron-driven failures need to land in mctl_list_incidents.
+          if { [ "$WORKFLOW_STATUS" = "Failed" ] || [ "$WORKFLOW_STATUS" = "Error" ]; } && [ -n "$MCTL_TOKEN" ]; then
+            # Suffix the id with epoch-second so `argo retry <wf>`
+            # produces a fresh incident — workflow names/UIDs stay
+            # stable across retries (Codex P2 on PR #149). Real cross-run
+            # dedup now happens via `fingerprint` below.
+            INCIDENT_ID="argo-${WORKFLOW_NAME}-$(date +%s)"
+            SUMMARY="shepherd ${SUBJECT} ${WORKFLOW_STATUS} after ${WORKFLOW_DURATION}s — ${UI_URL}"
+            if [ -n "$VERIFY_NOTE" ]; then
+              SUMMARY="${SUMMARY} | ${VERIFY_NOTE}"
+            fi
+            # JSON-encode via jq so quotes / newlines / backslashes in
+            # WORKFLOW_SLUG / WORKFLOW_SERVICE cannot break the body.
+            BODY=$(jq -nc --arg id "$INCIDENT_ID" --arg summary "$SUMMARY" --arg fingerprint "$FINGERPRINT" '{
+              id: $id,
+              source: "argo-workflows",
+              type: "workflow_failed",
+              tenant: "admins",
+              service: "mctl-agents",
+              summary: $summary,
+              severity: "warning",
+              # "analyzing", not "open": the incident-responder discovery
+              # query only picks up status=analyzing, and nothing in mctl-api
+              # ever promotes open->analyzing — a status of "open" here means
+              # the incident sits unanalyzed forever (observed 2026-07-12:
+              # 6 self-reported workflow_failed incidents never picked up).
+              status: "analyzing",
+              fingerprint: $fingerprint
+            }')
+            curl -s -o /dev/null -w 'incident http=%{http_code}\n' \
+              -X POST "https://api.mctl.ai/api/v1/incidents" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${MCTL_TOKEN}" \
+              -d "$BODY"
+          elif [ "$WORKFLOW_STATUS" = "Succeeded" ] && [ -n "$WORKFLOW_DEGRADED_APPS_UNFILTERED" ] && [ -n "$MCTL_TOKEN" ]; then
+            # This run succeeded, but the cluster still has Degraded apps
+            # that just predate this run's detection threshold — do NOT
+            # resolve. A missed resolve only means the incident needs a
+            # manual close later; a false resolve here would hide an
+            # ongoing outage (Codex P1 on PR #613).
+            echo "⚠️  Skipping resolve: still Degraded (unfiltered): ${WORKFLOW_DEGRADED_APPS_UNFILTERED}"
+          elif [ "$WORKFLOW_STATUS" = "Succeeded" ] && [ "$SHEPHERD_STATUS" != "succeeded" ] && [ -n "$MCTL_TOKEN" ]; then
+            # WORKFLOW_STATUS=Succeeded is not trustworthy on its own here —
+            # continueOn masks a run-shepherd crash (see run-shepherd).
+            # Don't resolve: a missed resolve just needs a manual close
+            # later; a false resolve here would hide a shepherd attempt
+            # that crashed before actually merging/fixing anything (Codex
+            # P1 on PR #613, round 3).
+            echo "⚠️  Skipping resolve: run-shepherd status was '${SHEPHERD_STATUS}', not a confirmed success."
+          elif [ "$WORKFLOW_STATUS" = "Succeeded" ] && [ "$WORKFLOW_DRY_RUN" = "true" ] && [ -n "$MCTL_TOKEN" ]; then
+            # dry_run=true only evaluates decide() and prints would-be
+            # transitions — no merge/review-fix subprocess ever ran, so a
+            # healthy post-deploy check here proves nothing about whether a
+            # REAL failed run for this scope was actually fixed. Resolving
+            # here would clear a real incident without anything having been
+            # done about it (Codex P2 on PR #613, round 3).
+            echo "ℹ️  Skipping resolve: dry_run=true run — no real action was taken for this scope."
+          elif [ "$WORKFLOW_STATUS" = "Succeeded" ] && [ -n "$MCTL_TOKEN" ]; then
+            # Close the loop: this scope's shepherd run finally succeeded
+            # AND no app in the cluster is currently Degraded, so resolve
+            # any open incident sharing this fingerprint. No-op if none
+            # exists.
+            RESOLVE_BODY=$(jq -nc --arg tenant "admins" --arg fingerprint "$FINGERPRINT" '{tenant: $tenant, fingerprint: $fingerprint}')
+            curl -s -o /dev/null -w 'resolve http=%{http_code}\n' \
+              -X POST "https://api.mctl.ai/api/v1/incidents/resolve-by-fingerprint" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${MCTL_TOKEN}" \
+              -d "$RESOLVE_BODY"
+          else
+            echo "ℹ️  Workflow ${WORKFLOW_STATUS} or MCTL_TOKEN missing; skipping incident leg."
+          fi
+          exit 0

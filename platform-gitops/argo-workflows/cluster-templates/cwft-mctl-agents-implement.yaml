@@ -1,0 +1,1509 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterWorkflowTemplate
+metadata:
+  name: mctl-agents-implement
+  annotations:
+    workflows.argoproj.io/description: |
+      Tier 2 — implementer.
+
+      Takes accepted proposals from platform-gitops/agents-state/<svc>/proposals/
+      (those with .status.yaml status=accepted) and opens PRs in the matching
+      sibling repos under mctlhq/. Runs:
+
+        1. run-implementer — orchestrator/run_implementer.py inside
+           ghcr.io/mctlhq/mctl-agents:<tag>. An initContainer SSH-clones
+           mctl-gitops via the shared deploy key; the Python script checks
+           GitHub, then, only when no prior result exists, gh-clones the
+           target sibling repo into /workdir/clones, runs the Claude Agent
+           SDK with the per-service implementer.md sub-agent, pushes the
+           branch, opens a PR. Finally it copies the .status.yaml files it
+           changed into an Argo artifact — the handoff to step 2. Retried
+           once on a second OAuth account; both attempts write the same
+           artifact key.
+        2. commit-and-push — takes its OWN fresh clone of mctl-gitops, lays
+           the artifact over it, and commits the .status.yaml updates to
+           main. It never touches the worktree the agent held (gitops#983 P1).
+
+      There is no shared workdir volume: each pod clones for itself and
+      cross-step state travels as an artifact. See the "No PVC" note on
+      spec.volumes for what that replaced and why (mctl-gitops#1047).
+
+      Triggered by:
+        - the DevLoop (Temporal) on every approved proposal
+        - mctl-api MCP tool mctl_trigger_implementer (admin-only)
+        - operator submitting a Workflow that references this CWFT
+spec:
+  serviceAccountName: argo-workflow-sa
+  imagePullSecrets:
+    - name: ghcr-credentials
+  # Promtail maps these pod labels to the Loki `app` and `team` labels. Argo
+  # pods otherwise cannot be found through mctl_get_service_logs during an
+  # incident (incident-17841555) — cwft-mctl-agents-run.yaml has carried these
+  # since that incident; the rest of the agent templates did not, so their pods
+  # stayed invisible to log search. They also give NetworkPolicy a selector
+  # that picks out agent pods without catching platform workflows
+  # (deploy-service, create-tenant, ...) that share this namespace and do need
+  # in-cluster egress.
+  podMetadata:
+    labels:
+      app.kubernetes.io/name: mctl-agents
+      mctl.ai/team: admins
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+  # volumeClaimGC is gone with the PVC — there is no claim left to reclaim.
+  #
+  # This is a RUNAWAY GUARD, not the work budget. The work budget is 7200s on
+  # the run-implementer template, where it belongs.
+  #
+  # It used to be 7200 here, and a spec-level deadline runs from SUBMIT, not
+  # from the moment the mutex below is acquired — so time spent queueing was
+  # charged to the implementer's own budget. mctl-agents-proposal-claims is a
+  # mutex (capacity 1) and one proposal takes 30-70 min, so only the first
+  # two or three submissions of a batch could ever start inside 2h. Everything
+  # behind them died Pending, having never created a pod.
+  #
+  # Worse than losing the attempt: the deadline is workflow-wide, so once
+  # `implement` had consumed it, `implement-fallback` AND `commit-and-push`
+  # were failed instantly with "Step exceeded its deadline" — and
+  # commit-and-push is the only step that writes `.status.yaml` back. The
+  # proposal stayed `accepted` with no branch, no PR and no failure recorded
+  # anywhere, which is exactly the state the `assert-produced` truthful-status
+  # design exists to prevent.
+  #
+  # 2026-09-19: six of nine implement runs lost this way in one night
+  # (mctl-agents#333 #334, mctl-telegram#438 #569, mctl-gitops#903 #1178).
+  #
+  # 8h = worst-case work (7200 primary + 7200 fallback + a bounded
+  # commit-and-push) plus room to queue behind two or three other runs. A
+  # deeper queue can still expire here, but it now expires having attempted
+  # nothing, instead of throwing away a finished attempt. Narrowing the mutex
+  # to the discovery+claim critical section is the real fix for the queue and
+  # is tracked separately.
+  activeDeadlineSeconds: 28800
+  entrypoint: implement-proposals
+  onExit: notify-telegram
+  # NB: mctl-gitops-main-writes lives on the commit-and-push template, not
+  # here at spec level — see the note there.
+
+  arguments:
+    parameters:
+      - name: service
+        value: ""
+        # Optional. When set, only proposals under that service's dir are
+        # considered. Validated by run_implementer.py against config/settings.py
+        # SERVICES (exit 1 on mismatch).
+      - name: slug
+        value: ""
+        # Optional. When set, only that slug is implemented (across services
+        # if `service` is empty too).
+      - name: force
+        value: "false"
+        # Deprecated compatibility parameter. true is rejected: retries now
+        # require an operator-reviewed needs-triage -> accepted transition.
+      - name: max_proposals
+        value: "1"
+        # Bound subscription usage and blast radius. Set explicitly to 0 only
+        # for an operator-reviewed manual batch.
+      - name: agent_image
+        value: ghcr.io/mctlhq/mctl-agents:1.117.0
+        # Default = today's pin, so submitting without this parameter is a
+        # zero-behaviour-change no-op. Overridden by the agent registry's
+        # resolved image_ref once a caller starts pinning per-run.
+      - name: agent_version
+        value: ""
+        # Registry version string, carried for the record only — not
+        # consumed by run-implementer. Left blank by any caller not yet
+        # using the registry.
+      - name: work_item_id
+        value: ""
+        # Optional. Canonical WorkItem id, minted by the caller (the
+        # dev-loop control plane). Correlation only — carried to the runner
+        # as env and NOT forwarded as a CLI flag: unlike
+        # cwft-mctl-agents-investigate.yaml, run_implementer.py has no
+        # --work-item-id flag, so appending one would make argparse exit
+        # non-zero on every run. Empty means absent; no value is ever
+        # derived. Read by the usage producer
+        # (mctl-agents orchestrator/usage_ledger.py) beside the existing
+        # WORKFLOW_NAME join key. Mirrors gitops#1279; owner decision 4 of
+        # mctlhq/.github#50.
+      - name: execution_id
+        value: ""
+        # Optional. Execution identity for THIS attempt, minted by the same
+        # caller alongside work_item_id. Same correlation-only, env-not-argv,
+        # empty-means-absent rules as work_item_id above.
+      - name: temporal_workflow_id
+        value: ""
+        # Optional. Id of the DevLoopWorkflow that submitted this run. Same
+        # correlation-only, env-not-argv, empty-means-absent rules as
+        # work_item_id above.
+      - name: temporal_run_id
+        value: ""
+        # Optional. Run id of that same DevLoopWorkflow. Same rules as
+        # temporal_workflow_id.
+      - name: execution_request_id
+        value: ""
+        # Optional. The mctl-api execution request (xr_...) this run
+        # fulfils, for correlation only: the execution identity is still
+        # execution_id. Same rules as work_item_id.
+      - name: traceparent
+        value: ""
+        # Optional. W3C trace context of the Temporal activity that
+        # submitted this run (mctl-agents#195), sent by a traced worker
+        # behind MCTL_TRACE_ARGO_PARAM. Read only as the TRACEPARENT env
+        # below, never interpolated into a script. Empty means no parent,
+        # and with MCTL_TRACE_REQUIRE_PARENT the pod then stays untraced.
+
+  # ── No PVC ──────────────────────────────────────────────────────────────
+  # Was a 10Gi `volumeClaimTemplates` entry — the LAST one in the agent fleet
+  # (mctl-gitops#1047). Argo provisioned it as a Hetzner Cloud volume at
+  # workflow start, and because the six steps were six pods spread across
+  # nodes, the RWO volume moved between nodes on every step: six attach/detach
+  # pairs per run, `Multi-Attach error` in the events on every one of them.
+  # With the DevLoop driving up to ~20 implement runs a day (2026-09-11) that
+  # was ~120 volume operations a day on one template. A wedged detach leaves
+  # a pod Pending, and a Pending pod holding `mctl-gitops-main-writes` is the
+  # 2026-07-30 cascade.
+  #
+  # An `emptyDir` at spec level gives EACH pod its own scratch dir (they are
+  # not shared — that is the whole reason the PVC existed). Cross-step state
+  # now travels as an Argo artifact; see `run-implementer` below. Nothing on
+  # this volume was ever durable, so there is nothing to lose by it.
+  #
+  # The two Go-module-cache steps that used to bridge the volume to MinIO
+  # (restore-go-cache / save-go-cache on minio/mc) are gone with it. They
+  # never worked once: the agent overrides GOPATH to $HOME/go on every run
+  # (178 `export GOPATH=$HOME/go` in one run's audit log), and the
+  # save-side emptiness check (`find -maxdepth 3 -type f`) cannot see a Go
+  # module cache even when it is full. Both ended in an unconditional
+  # `exit 0`, so six months of "starting cold" went unnoticed, and MinIO
+  # never held a `mctl-agents/gocache/` object. Removing dead code is not a
+  # regression; a cache that actually works is a separate design (per-service
+  # partitioned artifact at the path the agent really uses, plus per-language
+  # images so the Go/Zig/musl-cross bootstrap stops being paid at all) —
+  # tracked separately from this port.
+  #
+  # sizeLimit 10Gi because the implementer gh-clones each target sibling
+  # repo into `/workdir/clones` — ON THIS VOLUME — via TMPDIR, which
+  # run_implementer picks up through `tempfile.gettempdir()`. Worst case
+  # ~10 clones × ~500 MB. Measured on a real run
+  # (mctl-agents-implement-a7817a7c): `/workdir/clones` holds the working
+  # copy, while `/tmp` holds only toolchain downloads. Unlike a PVC, emptyDir
+  # counts toward kubelet's ephemeral-storage accounting, so a runaway clone
+  # evicts THIS pod instead of driving the node into DiskPressure and taking
+  # out whatever else shares it (vault and shared-pg live on the same three
+  # CX43 workers).
+  volumes:
+    - name: workdir
+      emptyDir:
+        sizeLimit: 10Gi
+    - name: deploy-key
+      secret:
+        secretName: mctl-gitops-deploy-key
+        defaultMode: 0600
+    # GITHUB_TOKEN as a static env var is fixed at pod start via secretKeyRef
+    # — fine for a short run, but this template's 7200s activeDeadlineSeconds
+    # can outlive an installation token's ~60min TTL. A Secret volume is
+    # refreshed by kubelet roughly every sync period (default ~1min)
+    # independent of pod lifetime, so mounting it and re-reading at each
+    # gh/git call (orchestrator/github_token.py:refresh_github_token, wired
+    # into run_implementer.py's _run()) stays current for the whole run. See
+    # GITHUB_TOKEN_FILE on run-implementer below.
+    - name: github-token-file
+      secret:
+        secretName: mctl-agents-secrets
+        defaultMode: 0440
+        items:
+          - key: github-token
+            path: github-token
+    # Least-privilege credentials for the implement run (mctlhq/mctl-agents#717,
+    # mctl-gitops#1980), as on investigate: a pod-bound ServiceAccount token
+    # with an audience only mctl-api's run-token exchange accepts. mctl-api
+    # verifies it with TokenReview, finds the pod and this Workflow, and
+    # issues a run token scoped to the implement surface and this run's
+    # execution_id. It grants nothing in the Kubernetes API (mctl-agents-runner
+    # has no role bindings). Mounted into run-implementer's agent container
+    # only.
+    - name: mctl-api-run-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              audience: mctl-api-agent-run
+              expirationSeconds: 3600
+              path: token
+
+  # No `outputs.parameters` anywhere in this file. onExit used to read
+  # `/workdir/activity` off the shared PVC precisely to avoid
+  # `workflow.outputs.parameters`: a second entry sourced from a different
+  # step broke Argo's static validator workflow-wide on 2026-07-06
+  # (#530/#531), and the shepherd's single remaining entry then turned out
+  # not to resolve inside an exit handler either (gitops#1186). `activity`
+  # now travels as an Argo ARTIFACT addressed by literal S3 key — the
+  # channel proven on cwft-mctl-agents-shepherd, which has neither limit.
+
+  templates:
+    - name: implement-proposals
+      steps:
+        # No `clone` step: with emptyDir there is no shared volume for one
+        # step to clone into on another's behalf. Each pod that needs the
+        # gitops checkout takes its own, as an initContainer.
+        - - name: implement
+            template: run-implementer
+            arguments:
+              parameters:
+                - name: oauth-key
+                  value: claude-code-oauth-token
+                - name: is-fallback
+                  value: "false"
+            # run_implementer.py writes .status.yaml updates (in-progress →
+            # implemented/error) BEFORE any failure that may crash the step.
+            # Without continueOn, Argo would skip commit-and-push on non-zero
+            # exit, those updates would never persist back to mctl-gitops
+            # main, and the next run would reprocess the same proposal —
+            # duplicate PR attempts. Letting commit run unconditionally makes
+            # the status durable; commit-and-push handles the "no handoff"
+            # case as a clean no-op.
+            #
+            # Both failed AND error: Argo distinguishes app-level non-zero
+            # exits (Failed) from pod-level errors like OOMKilled / deadline /
+            # controller errors (Error). Both can leave partial .status.yaml
+            # writes, so commit-and-push must run in either case.
+            continueOn:
+              failed: true
+              error: true
+        # Fallback retry on a SECOND Claude account, mirroring
+        # cwft-mctl-agents-run / -investigate / -shepherd: if the primary
+        # attempt did not succeed (most commonly the account-1 OAuth token
+        # hitting its five_hour/seven_day usage limit → HTTP 429), retry once
+        # on the account-2 token `claude-code-oauth-token-2`. Previously this
+        # CWFT had no fallback at all — a quota-exhausted primary token
+        # aborted the whole implement step with no retry, discovered
+        # 2026-08-05 when the phase-4 DevLoopWorkflow E2E verification hit
+        # exactly this gap. If token-2 is not seeded the fallback fails
+        # (exit 1) so the run reports Failed instead of being masked as
+        # success.
+        - - name: implement-fallback
+            template: run-implementer
+            when: "{{steps.implement.status}} != Succeeded"
+            arguments:
+              parameters:
+                - name: oauth-key
+                  value: claude-code-oauth-token-2
+                - name: is-fallback
+                  value: "true"
+            continueOn:
+              failed: true
+              error: true
+        - - name: commit
+            template: commit-and-push
+        # Truthful status. implement runs with continueOn so a structured
+        # needs-triage status is still committed. Fail the workflow when the
+        # single bounded attempt failed. A genuine
+        # "nothing accepted to implement" run still has implement=Succeeded, so
+        # this never fails a legitimate no-op.
+        - - name: assert-produced
+            template: assert-attempt
+            arguments:
+              parameters:
+                - name: primary
+                  value: "{{steps.implement.status}}"
+                - name: fallback
+                  value: "{{steps.implement-fallback.status}}"
+
+    # ── 1. Run implementer orchestrator ───────────────────────────────────
+    # 1.20.0 makes GitHub authoritative, preserves every status field, and
+    # quarantines incomplete attempts instead of force-retrying them.
+    - name: run-implementer
+      # Least privilege: this step needs neither the Kubernetes API nor Vault.
+      # The pod runs as an identity with no role bindings and mounts no API
+      # token into the agent or clone containers; only Argo's own init/wait
+      # containers get the executor token, to report the step result. See
+      # config/sa-and-rbac.yaml. Template-level on purpose: the other steps
+      # keep the workflow-level account.
+      serviceAccountName: mctl-agents-runner
+      automountServiceAccountToken: false
+      executor:
+        serviceAccountName: mctl-agents-executor
+      # Restricted pod posture for the step that runs model-driven shell
+      # (mctl-gitops#1717). Template-level: the helper steps are root images.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      outputs:
+        artifacts:
+          # The `.status.yaml` updates THIS attempt made, at repo-relative
+          # paths. Replaces the shared workdir PVC as the channel to
+          # commit-and-push.
+          #
+          # Fixed, workflow-scoped S3 key rather than Argo's default per-pod
+          # key, and commit-and-push reads that literal key instead of
+          # `{{steps.<step>.outputs.artifacts.changes}}`: exactly one of the
+          # primary/fallback pair is skipped on every happy run, and a
+          # reference to a skipped step does not resolve. Both attempts write
+          # this one key, so there is no step reference to break; when both
+          # run the fallback goes second and wins.
+          #
+          # `optional: true` with the directory created only once there is
+          # something to put in it, so an attempt that produced nothing
+          # uploads nothing and leaves a previous attempt's object intact.
+          - name: changes
+            path: /tmp/state-out
+            optional: true
+            s3:
+              key: "{{workflow.name}}/agents-state.tgz"
+      initContainers:
+        # kube-router admits a new pod's IP into the proxy's ingress ipset a
+        # few seconds after the pod starts; a first connection inside that
+        # window is dropped (gitops#2164). Hold the pod until the proxy
+        # accepts a TCP connect, at most ~90s.
+        - name: wait-egress-proxy
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              for i in $(seq 1 30); do
+                nc -z -w 2 agent-egress-proxy.mctl-agents-egress.svc.cluster.local 3128 && exit 0
+                sleep 1
+              done
+              echo "agent-egress-proxy unreachable after ~90s" >&2
+              exit 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+        - name: clone-gitops
+          image: alpine/git:2.43.0
+          env:
+            - name: HTTPS_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: HTTP_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: https_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: http_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: NO_PROXY
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: no_proxy
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+              value: "1"
+          # Root on purpose: apk add + chown -R 1000:1000 /workdir hand-off
+          # (validate-local-workdir.py). Escalation is off and every capability
+          # except the file-ownership ones is dropped (mctl-gitops#1717).
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+          command: [sh, -c]
+          args:
+            - |
+              set -e
+              apk add --no-cache openssh-client ca-certificates socat
+              mkdir -p ~/.ssh
+              cp /secrets/deploy-key/ssh-privatekey ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  ProxyCommand socat - PROXY:agent-egress-proxy.mctl-agents-egress.svc.cluster.local:%%h:%%p,proxyport=3128\n  IdentityFile ~/.ssh/id_ed25519\n' > ~/.ssh/config
+              # GitHub's published SSH host keys, PINNED rather than trusted on
+              # first use. Source: https://api.github.com/meta (.ssh_keys),
+              # fetched 2026-09-02. This replaces StrictHostKeyChecking=no,
+              # which accepted whatever key answered on a connection that
+              # carries a WRITE-capable deploy key: a MITM or a DNS-poison of
+              # ssh.github.com was handed that key with no complaint.
+              #
+              # Keyed on [ssh.github.com]:443, not github.com. The Host block
+              # above rewrites hostname and port, and ssh looks up what it
+              # actually connects to — a github.com entry would silently miss.
+              #
+              # If GitHub rotates a host key these lines must be updated; it
+              # last happened in March 2023, when the RSA key was replaced.
+              cat > ~/.ssh/known_hosts <<'GITHUB_HOST_KEYS'
+              [ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+              [ssh.github.com]:443 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+              [ssh.github.com]:443 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+              GITHUB_HOST_KEYS
+              chmod 600 ~/.ssh/known_hosts
+              chmod 600 ~/.ssh/config
+              # Bounded retry. On 2026-11-04 10:54-11:16Z GitHub dropped SSH
+              # sessions right after the handshake (proxy tunnels were 200), every
+              # clone exited 128 and each failed run fanned out into an incident.
+              # Same key and URL on every try; git prints its own stderr.
+              for attempt in 1 2 3; do
+                if git clone --depth=1 git@github.com:mctlhq/mctl-gitops.git /workdir/mctl-gitops; then
+                  break
+                fi
+                rm -rf /workdir/mctl-gitops
+                if [ "$attempt" = 3 ]; then
+                  echo "clone-gitops: git clone failed after 3 attempts" >&2
+                  exit 128
+                fi
+                echo "clone-gitops: attempt $attempt failed, retrying" >&2
+                sleep $((attempt * 15))
+              done
+              mkdir -p /workdir/mctl-gitops/platform-gitops/agents-state
+              # Scratch dir for run_implementer's `gh repo clone` targets. The
+              # orchestrator picks up `tempfile.gettempdir()` which honors
+              # TMPDIR — see run-implementer env below. Without this Python's
+              # mkdtemp errors on the missing directory.
+              mkdir -p /workdir/clones
+              # uid 1000 is the mctl-agents image USER (SOC F8). This clone step
+              # runs as root in alpine/git; without the handoff the next step
+              # cannot write STATE_DIR or TMPDIR.
+              chown -R 1000:1000 /workdir
+              echo "✓ gitops cloned"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi, ephemeral-storage: 10Gi }
+            limits:   { cpu: 500m, memory: 256Mi, ephemeral-storage: 11Gi }
+          volumeMounts:
+            - name: workdir
+              mountPath: /workdir
+            - name: deploy-key
+              mountPath: /secrets/deploy-key
+      inputs:
+        parameters:
+          # Which Vault key under mctl-agents-secrets holds the OAuth token for
+          # this run. Primary step passes claude-code-oauth-token; the
+          # fallback step passes claude-code-oauth-token-2 (a second
+          # account). Same convention as cwft-mctl-agents-run/-investigate.
+          - name: oauth-key
+            value: claude-code-oauth-token
+          # "true" only for the fallback retry: fail loudly if token-2 is
+          # absent instead of masking the double-failure as success.
+          - name: is-fallback
+            value: "false"
+      # run_implementer discovers accepted proposals and only then persists
+      # the in-progress claim inside implement_one(). Keep that discovery and
+      # claim serialized across implementer workflows; otherwise two cron or
+      # manually-triggered runs can both select the same accepted proposal
+      # before either status update reaches git. This mutex is intentionally
+      # separate from mctl-gitops-main-writes, so implementation does not
+      # block unrelated workflows that only need to push to main.
+      synchronization:
+        mutex:
+          name: mctl-agents-proposal-claims
+      # The real work budget, and the reason the spec-level ceiling above is
+      # only a runaway guard. A template deadline is applied to the POD, so it
+      # runs from the pod's start — after the mutex above is acquired. Queue
+      # time is no longer charged to the attempt.
+      #
+      # 7200 is the same ceiling this template has always had, kept as the
+      # outer net around the 5400s IMPLEMENTER_TIMEOUT_SECONDS below; it bounds
+      # a hung model stream that the inner `anyio.fail_after` fails to unwind.
+      # It applies to `implement` and `implement-fallback` alike — both are
+      # this one template — so a primary that burns its full budget no longer
+      # leaves the fallback nothing to run in.
+      activeDeadlineSeconds: 7200
+      container:
+        image: "{{workflow.parameters.agent_image}}"
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        imagePullPolicy: IfNotPresent
+        command: ["/entrypoint.sh"]
+        args:
+          - "sh"
+          - "-c"
+          - |
+            set -e
+            # Fallback retry (account 2): only fires when the primary attempt
+            # did not succeed. If the fallback token is unset, fail loudly so
+            # the run reports Failed instead of being masked as success.
+            if [ "$IS_FALLBACK" = "true" ]; then
+              if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+                echo "❌ Primary implement failed and no fallback token (claude-code-oauth-token-2) is set — cannot fall back." >&2
+                exit 1
+              fi
+              echo "↻ Primary implement did not succeed — retrying on fallback OAuth token (account 2)."
+            fi
+            if [ "$WORKFLOW_FORCE" = "true" ]; then
+              echo "❌ force=true is no longer supported." >&2
+              echo "   Review needs-triage, then move only that proposal back to accepted." >&2
+              exit 2
+            fi
+            # Wire git's HTTPS credential helper to the same GITHUB_TOKEN
+            # gh CLI uses. Without this, `gh repo clone` succeeds (it speaks
+            # to the API directly) but the implementer's later `git push -u
+            # origin <branch>` falls through to interactive auth and fails
+            # with "could not read Username for 'https://github.com'".
+            # `gh auth setup-git` installs `gh auth git-credential` as the
+            # credential helper, which reads GITHUB_TOKEN from the env at
+            # push time. Skip silently if no token (fail-closed at gh clone
+            # already; this just keeps the path clean for offline smoke).
+            if [ -s "$GITHUB_TOKEN_FILE" ]; then
+              GITHUB_TOKEN="$(cat "$GITHUB_TOKEN_FILE")" gh auth setup-git
+            fi
+            # Read params from env, NOT inline workflow.parameters interpolation
+            # (Argo template syntax): a value like `; rm -rf /` would otherwise be
+            # spliced straight into the shell command. Build argv via `set --`
+            # so each flag/value pair is a separate, properly quoted token.
+            set -- python -m orchestrator.run_implementer
+            if [ -n "$WORKFLOW_SERVICE" ]; then
+              set -- "$@" --service "$WORKFLOW_SERVICE"
+            fi
+            if [ -n "$WORKFLOW_SLUG" ]; then
+              set -- "$@" --slug "$WORKFLOW_SLUG"
+            fi
+            set -- "$@" --max-proposals "$WORKFLOW_MAX_PROPOSALS"
+            printf '→'
+            printf ' %s' "$@"
+            printf '\n'
+            # Deliberately NOT `exec`, and deliberately not fatal — the same
+            # shape as run-orchestrator, run-investigator and run-shepherd.
+            # run_implementer writes .status.yaml before any later failure
+            # path, and that work must still reach main. It used to fall out
+            # of `continueOn` plus a shared PVC; with an artifact handoff this
+            # script collects the files itself before exiting, so the exit
+            # code is captured and re-raised at the end. `set +e` around the
+            # attempt is load-bearing: under `set -e` a failing command aborts
+            # the script immediately and the collector below never runs.
+            set +e
+            "$@"
+            RC=$?
+            set -e
+            echo "implementer exited ${RC}"
+
+            # Collect exactly what commit-and-push may push: .status.yaml
+            # files under agents-state, nothing else. Anything else changed
+            # there (proposal bodies, digests, ad-hoc files left by a crashed
+            # implementer) is NOT what this workflow should be pushing back
+            # to gitops main — FATAL rather than skipped, so the scope never
+            # silently broadens.
+            #
+            # Parsed in Python, NOT in the shell. `git status -z` emits paths
+            # RAW, so a directory name carrying a literal newline splits a
+            # `tr` + `cut -c4-` pipeline into two entries and the second is
+            # attacker-chosen — the path-smuggling hole found on #1042. The
+            # SDK agent holds Bash in this worktree, so such a name is
+            # reachable. Splitting on NUL in Python has no such ambiguity, and
+            # a path outside the allowed set, containing `..`, or carrying a
+            # control character is FATAL rather than skipped.
+            python - "$RC" <<'COLLECT'
+            import os
+            import re
+            import shutil
+            import subprocess
+            import sys
+
+            ROOT = "/workdir/mctl-gitops"
+            OUT = "/tmp/state-out"
+            TREE = os.path.join(OUT, "tree")
+            DELETED = os.path.join(OUT, "deleted.lst")
+            ALLOWED = re.compile(r"^platform-gitops/agents-state/.+/\.status\.yaml$")
+            PATHSPEC = "platform-gitops/agents-state/"
+            rc = int(sys.argv[1])
+
+            # Cleared HERE, after the agent has exited, and owned by this script alone.
+            # The agent holds Bash in this container, so a reset before it ran would let
+            # it plant a directory that Argo then uploads as the handoff. The invariant is
+            # stated once: this directory exists at exit iff this script filled it.
+            shutil.rmtree(OUT, ignore_errors=True)
+
+            # The WHOLE agents-state subtree is scanned, not just `.status.yaml`
+            # matches: a non-status change there is what the PVC-era guard
+            # refused with "changes outside .status.yaml", and narrowing the
+            # pathspec would turn that refusal into silent omission.
+            raw = subprocess.run(
+                ["git", "-C", ROOT, "status", "--porcelain=v1", "-z", "-uall", "--", PATHSPEC],
+                capture_output=True, check=True).stdout
+
+
+            def _text(b):
+                return b.decode("utf-8", "surrogateescape")
+
+
+            # porcelain -z is NOT one record per NUL-separated field. A rename or copy is
+            # emitted as `XY new\0old\0` — the status prefix is on the FIRST field only, so
+            # slicing [3:] off every field chops three real characters off the old path
+            # (claude P2 on #1046). Walk the fields with an index and consume the extra one.
+            fields = [f for f in raw.split(b"\x00") if f != b""]
+            copies, deletions = [], []
+            i = 0
+            while i < len(fields):
+                entry = fields[i]
+                i += 1
+                status = _text(entry[:2])
+                path = _text(entry[3:])
+                # Both status columns, matching cwft-mctl-agents-run and
+                # -shepherd. A plain `mv` produces no rename entry at all
+                # (measured: `" D old"` + `"?? new"`), so the Y column is not
+                # reachable in practice here — but a missed pair would desync the
+                # NUL walk for every entry after it, and that fails silently.
+                if "R" in status or "C" in status:
+                    if i >= len(fields):
+                        sys.stderr.write("malformed rename entry: missing original path\n")
+                        sys.exit(1)
+                    original = _text(fields[i])
+                    i += 1
+                    # A rename removes the old path; a copy leaves it in place.
+                    if "R" in status:
+                        deletions.append(original)
+                src = os.path.join(ROOT, path)
+                if os.path.islink(src):
+                    print("skipping %s (symlink)" % path)
+                    continue
+                # A path git reports that no longer exists on disk is a DELETION, and it
+                # has to travel too: commit-and-push lays this handoff over a fresh clone,
+                # which is purely additive, so a removal the agent made would otherwise
+                # never reach main (claude P1 on #1046).
+                (copies if os.path.isfile(src) else deletions).append(path)
+
+            bad = [
+                p for p in copies + deletions
+                if not ALLOWED.match(p) or ".." in p.split("/") or any(c in p for c in "\n\r\t")
+            ]
+            if bad:
+                sys.stderr.write("refusing to hand off paths that are not .status.yaml under agents-state:\n")
+                for p in bad:
+                    sys.stderr.write("  %r\n" % p)
+                sys.exit(1)
+
+            if not copies and not deletions:
+                print("nothing to hand off")
+                sys.exit(rc)
+
+            os.makedirs(TREE, exist_ok=True)
+            for rel in copies:
+                dst = os.path.join(TREE, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                # follow_symlinks=False, and it is a secret-leak guard rather than
+                # tidiness. The islink() check happens in the classification loop
+                # above and the copy here — two passes — and the SDK agent can leave
+                # a background process alive past its own exit, so a path checked as
+                # a regular file can be a symlink by the time it is copied. copy2
+                # DEREFERENCES by default, so that would read the target — e.g. the
+                # GitHub token mounted at /var/run/gh — and land its contents in the
+                # handoff as an ORDINARY FILE, which commit-and-push's `! -type f`
+                # check then cannot tell from a legitimate one, and it reaches main.
+                # Copying the LINK keeps it a symlink, which that check does catch
+                # (agy P1 on gitops#1048).
+                shutil.copy2(os.path.join(ROOT, rel), dst, follow_symlinks=False)
+                print("handing off %s" % rel)
+
+            # Newline-separated is unambiguous here precisely because the check above
+            # already refused any path carrying a control character.
+            if deletions:
+                with open(DELETED, "w", encoding="utf-8") as fh:
+                    for rel in deletions:
+                        fh.write(rel + "\n")
+                        print("handing off DELETION of %s" % rel)
+
+            sys.exit(rc)
+            COLLECT
+        env:
+          - name: HTTPS_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: HTTP_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: https_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: http_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: NO_PROXY
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: no_proxy
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            value: "1"
+          - name: IS_FALLBACK
+            value: "{{inputs.parameters.is-fallback}}"
+          # Workflow params injected as env vars so the shell layer can quote
+          # them safely. Direct `workflow.parameters.*` (Argo template syntax) interpolation in
+          # the script body is a shell-injection vector.
+          - name: WORKFLOW_SERVICE
+            value: "{{workflow.parameters.service}}"
+          - name: WORKFLOW_SLUG
+            value: "{{workflow.parameters.slug}}"
+          - name: WORKFLOW_FORCE
+            value: "{{workflow.parameters.force}}"
+          - name: WORKFLOW_MAX_PROPOSALS
+            value: "{{workflow.parameters.max_proposals}}"
+          # Wall-clock budget for one implement operation
+          # (orchestrator/options.py, default 900). 900s killed two
+          # legitimately-progressing large runs at ~87% done (portal
+          # issue-80 retry-3 on 2026-08-28, mctl-agent issue-99 twice on
+          # 2026-08-29 — the second one had both commits made and the full
+          # test suite green, and died before push), so it was raised to 2400.
+          # 2400 then killed mctl-telegram issue-482 on 2026-09-03 with zero
+          # output: that proposal is 9 implementation tasks plus 26 tests
+          # across five new HTTP routes, a five-state machine, a consent page
+          # and a rate limiter — larger than anything the 40 min budget was
+          # sized against. 90 min covers it with margin and still bounds a
+          # hung model stream well inside the step-level
+          # activeDeadlineSeconds (7200), which remains the outer safety net.
+          - name: IMPLEMENTER_TIMEOUT_SECONDS
+            value: "5400"
+          # Same STATE_DIR layout as cwft-mctl-agents-run — entrypoint.sh
+          # symlinks <state>/<svc>/proposals onto /app/agents/<svc>/proposals/
+          # so the SDK sees them, and run_implementer reads them directly.
+          - name: STATE_DIR
+            value: /workdir/mctl-gitops/platform-gitops/agents-state
+          # Redirect Python's `tempfile.gettempdir()` (used by
+          # run_implementer._clone_target) onto the sized emptyDir so each
+          # `gh repo clone` lands under the volume's sizeLimit and not in
+          # the container's writable layer. The initContainer creates this
+          # dir; if it doesn't exist Python's mkstemp / mkdtemp will error.
+          - name: TMPDIR
+            value: /workdir/clones
+          # Auth: OAuth (Claude Pro/Max). Key is parameterized: primary uses
+          # claude-code-oauth-token, the fallback step uses
+          # claude-code-oauth-token-2. optional:true lets the fallback pod
+          # schedule when token-2 is absent (the guard script then exits 1);
+          # a missing PRIMARY token still fails loudly at SDK auth without
+          # changing accepted proposals.
+          - name: CLAUDE_CODE_OAUTH_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: "{{inputs.parameters.oauth-key}}"
+                optional: true
+          # GitHub PAT for `gh repo clone` + `gh pr create`. PAT must have
+          # repo write scope on mctlhq/*. Sub-plan B introduces this key in
+          # the shared secret (same Vault path) — uses `dataFrom: extract`,
+          # so no manifest change is needed once Vault has it. If the key
+          # is absent, gh CLI falls through to interactive login and the
+          # implementer fails fast at clone-target step. Marked optional:
+          # local smoke runs without GITHUB_TOKEN can still exercise the
+          # discovery path (--dry-run).
+          # Path to the mounted Secret volume (see spec.volumes above).
+          # refresh_github_token() re-reads GITHUB_TOKEN from this file
+          # before every gh/git subprocess, so a run that outlives the
+          # token's ~60min TTL still authenticates correctly. There is no
+          # GITHUB_TOKEN env seed (#2288): the file is the only delivery.
+          - name: GITHUB_TOKEN_FILE
+            value: /var/run/gh/github-token
+          # Scoped run token (mctlhq/mctl-agents#717): off | observe | enforce.
+          # observe exchanges the projected token above (scope `implement`,
+          # bound to WORKFLOW_EXECUTION_ID) and revokes the result at once to
+          # prove the path, keeps every call on MCTL_TOKEN and names the scope
+          # in a shadow header that mctl-api only counts. Nothing changes for
+          # the run: a failed exchange is logged, not fatal. Needs mctl-api
+          # >= 4.154.0 and mctl-agents >= 1.117.0; an older image ignores it.
+          # Rollback: remove these two variables (mode off). Not set on the
+          # shepherd template: it runs run_implementer as a subprocess and
+          # stays off.
+          - name: MCTL_RUN_TOKEN_MODE
+            value: observe
+          - name: MCTL_RUN_TOKEN_SA_TOKEN_FILE
+            value: /var/run/secrets/mctl-api/token
+          # Optional MCP token, same convention as run pipeline.
+          - name: MCTL_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: mctl-token
+                optional: true
+          # Policy checkpoint approvals backend (ADR 014; mctlhq/.github#181,
+          # mctl-gitops#1980), as on investigate: a non-read mcp__mctl__* call
+          # creates or redeems a durable approval request in mctl-api instead
+          # of being blocked outright. Authenticates with MCTL_TOKEN; needs
+          # mctl-agents >= 1.86.1. Must stay a literal (see
+          # platform-gitops/governance/policy-checkpoint-coverage.yaml).
+          # Rollback: remove it (REQUIRE_APPROVAL then blocks) and mark the
+          # manifest entry governed: false with a tracked_by.
+          - name: MCTL_POLICY_APPROVALS
+            value: mctl-api
+          # Usage-writer token (mctlhq/.github#50): the only credential the
+          # usage producer may use to append this run's model-usage records
+          # to mctl-api. It may do nothing else there. Optional: absent (the
+          # default until the owner provisions it) the producer logs once and
+          # records nothing; the run itself is unaffected.
+          - name: MCTL_USAGE_WRITER_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: usage-writer-token
+                optional: true
+          # Bearer token of the evidence-writer principal (mctlhq/mctl-agents#199,
+          # ADR 018): the producer posts one sealed execution-evidence envelope
+          # per governed run to mctl-api and may do nothing else there.
+          # Optional and never fatal: absent, the producer logs once and posts
+          # nothing; the run itself is unaffected.
+          - name: MCTL_EVIDENCE_WRITER_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: evidence-writer-token
+                optional: true
+          # ADR 018 Amendment 2 blocks (versions, subject, tool_calls,
+          # provenance). mctl-api accepts them since 4.66.0 (mctl-api#473).
+          - name: MCTL_EVIDENCE_AMENDMENT_2
+            value: "true"
+          # The Argo run name, the join key of this run's usage records to
+          # its agent_executions row (argo_workflow_name). Read by nothing
+          # else in this runner.
+          - name: WORKFLOW_NAME
+            value: "{{workflow.name}}"
+          # Optional Temporal / WorkItem correlation (gitops#1408, mirroring
+          # gitops#1279 on cwft-mctl-agents-investigate.yaml). Read by the
+          # usage producer (mctl-agents orchestrator/usage_ledger.py) next to
+          # WORKFLOW_NAME above; NOT consumed by run_implementer's argv,
+          # which has no such flags. Empty for every caller that does not
+          # set them. Enforced by
+          # scripts/validate-shell-param-interpolation.py: these names are in
+          # neither its BASELINE nor its CONSTRAINED set, so interpolating
+          # them into the script body instead of env would fail CI.
+          - name: WORKFLOW_WORK_ITEM_ID
+            value: "{{workflow.parameters.work_item_id}}"
+          - name: WORKFLOW_EXECUTION_ID
+            value: "{{workflow.parameters.execution_id}}"
+          - name: WORKFLOW_TEMPORAL_WORKFLOW_ID
+            value: "{{workflow.parameters.temporal_workflow_id}}"
+          - name: WORKFLOW_TEMPORAL_RUN_ID
+            value: "{{workflow.parameters.temporal_run_id}}"
+          - name: WORKFLOW_EXECUTION_REQUEST_ID
+            value: "{{workflow.parameters.execution_request_id}}"
+          # Execution traces (mctl-agents#195, docs/observability/
+          # execution-traces.md in mctl-agents). TRACEPARENT
+          # parents the pod's root span on the submitting activity.
+          # ARGO_WORKFLOW_NAME stamps mctl.argo.workflow.name.
+          # MCTL_TRACE_REQUIRE_PARENT keeps a pod that no traced DevLoop
+          # submitted (manual, sweep) inert once the endpoint is added,
+          # which bounds the rollout to the ADR 0001 producer amendment.
+          - name: TRACEPARENT
+            value: "{{workflow.parameters.traceparent}}"
+          - name: ARGO_WORKFLOW_NAME
+            value: "{{workflow.name}}"
+          - name: MCTL_TRACE_REQUIRE_PARENT
+            value: "true"
+          # OTLP export (ADR 0001 producer amendment). Only a pod whose
+          # TRACEPARENT is sampled exports, per the gate above.
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: http://otel-collector.monitoring.svc.cluster.local:4318
+          - name: OTEL_EXPORTER_OTLP_PROTOCOL
+            value: http/protobuf
+          # Soft cap per proposal. Raised 3.00 -> 10.00: large issue-driven
+          # proposals (e.g. a full observability layer) blew the $3 cap and
+          # the SDK raised error_max_budget_usd before opening a PR. Small
+          # proposals still finish well under this.
+          # Raised 10.00 -> 20.00: mctl-telegram issue-287 (send_media tool)
+          # hit error_max_budget_usd at $10.10/140 tool uses with real,
+          # near-complete work (tests passing, at gofmt) still unfinished —
+          # a Go service with no per-service implementer image pays a cold
+          # Go-toolchain-bootstrap + full gotd/td module-cache build tax on
+          # top of the actual implementation cost every single run.
+          - name: IMPLEMENTER_BUDGET_USD
+            value: "20.00"
+        resources:
+          # memory bumped 4Gi -> 8Gi: the implementer sub-agent runs the
+          # target repo's build as a sanity check; `go build ./...` on a
+          # large Go service (e.g. mctl-telegram + gotd/td) on top of the
+          # Claude SDK process exceeded 4Gi and the container was OOMKilled.
+          # cpu bumped 2000m -> 3000m: observed pegged at the 2-core limit
+          # during issue-283's run (Go toolchain bootstrap + SDK process
+          # contending for CPU), same profile as an earlier real stall.
+          # ephemeral-storage: the workdir is an emptyDir now and counts
+          # against this pod, so the clone budget is declared here rather
+          # than left for the node to absorb.
+          # memory request bumped 1Gi -> 3Gi on 2026-09-12. The scheduler only
+          # ever sees the request, so a 1Gi/8Gi spread let an unbounded number
+          # of these land on one node against headroom that does not exist --
+          # this step carries no mutex (the two in this template cover the
+          # proposal claim and the gitops write). Measured over 7 days on
+          # worker-hnn: 6 of 18 runs exceeded 3Gi working set, one sat at
+          # 8134Mi against the 8Gi limit, and the node's anonymous memory
+          # reached 14100Mi of 15612Mi (90.3%) with nothing alerting. 3Gi is
+          # the realistic level, not the peak; the 8Gi limit stays, it is what
+          # keeps a `go build` run from being OOMKilled.
+          requests: { cpu: 200m, memory: 3Gi, ephemeral-storage: 10Gi }
+          limits:   { cpu: 3000m, memory: 8Gi, ephemeral-storage: 11Gi }
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+          - name: github-token-file
+            mountPath: /var/run/gh
+            readOnly: true
+          - name: mctl-api-run-token
+            mountPath: /var/run/secrets/mctl-api
+            readOnly: true
+
+    # ── 2. Commit & push back to mctl-gitops ──────────────────────────────
+    # Only .status.yaml files should change in agents-state/ (run_implementer
+    # writes them after each proposal). Defensive: stage only that subtree.
+    - name: commit-and-push
+      inputs:
+        artifacts:
+          # The `.status.yaml` updates whichever attempt ran handed off,
+          # unpacked here and copied over this pod's OWN fresh clone. Literal
+          # S3 key, not a step reference: one of the primary/fallback pair is
+          # always skipped and a reference to a skipped step does not
+          # resolve. `optional: true` covers the case where neither attempt
+          # uploaded anything — the script treats an absent or empty handoff
+          # as a clean no-op.
+          - name: changes
+            path: /artifact
+            optional: true
+            s3:
+              key: "{{workflow.name}}/agents-state.tgz"
+      outputs:
+        artifacts:
+          # The onExit channel for `activity`. notify-telegram used to read
+          # this off the shared PVC; an onExit pod gets its own emptyDir, so
+          # it travels as an artifact addressed by literal key instead. NOT a
+          # `workflow.outputs.parameters` entry — see the note above
+          # `templates:`.
+          - name: activity
+            path: /tmp/onexit
+            optional: true
+            s3:
+              key: "{{workflow.name}}/onexit-activity.tgz"
+      initContainers:
+        # kube-router admits a new pod's IP into the proxy's ingress ipset a
+        # few seconds after the pod starts; a first connection inside that
+        # window is dropped (gitops#2164). Hold the pod until the proxy
+        # accepts a TCP connect, at most ~90s.
+        - name: wait-egress-proxy
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              for i in $(seq 1 30); do
+                nc -z -w 2 agent-egress-proxy.mctl-agents-egress.svc.cluster.local 3128 && exit 0
+                sleep 1
+              done
+              echo "agent-egress-proxy unreachable after ~90s" >&2
+              exit 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+        - name: clone-gitops
+          image: alpine/git:2.43.0
+          env:
+            - name: HTTPS_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: HTTP_PROXY
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: https_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: http_proxy
+              value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+            - name: NO_PROXY
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: no_proxy
+              value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+            - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+              value: "1"
+          command: [sh, -c]
+          args:
+            - |
+              set -e
+              apk add --no-cache openssh-client ca-certificates socat
+              mkdir -p ~/.ssh
+              cp /secrets/deploy-key/ssh-privatekey ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  ProxyCommand socat - PROXY:agent-egress-proxy.mctl-agents-egress.svc.cluster.local:%%h:%%p,proxyport=3128\n  IdentityFile ~/.ssh/id_ed25519\n' > ~/.ssh/config
+              # GitHub's published SSH host keys, PINNED rather than trusted on
+              # first use. Source: https://api.github.com/meta (.ssh_keys),
+              # fetched 2026-09-02. This replaces StrictHostKeyChecking=no,
+              # which accepted whatever key answered on a connection that
+              # carries a WRITE-capable deploy key: a MITM or a DNS-poison of
+              # ssh.github.com was handed that key with no complaint.
+              #
+              # Keyed on [ssh.github.com]:443, not github.com. The Host block
+              # above rewrites hostname and port, and ssh looks up what it
+              # actually connects to — a github.com entry would silently miss.
+              #
+              # If GitHub rotates a host key these lines must be updated; it
+              # last happened in March 2023, when the RSA key was replaced.
+              cat > ~/.ssh/known_hosts <<'GITHUB_HOST_KEYS'
+              [ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+              [ssh.github.com]:443 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+              [ssh.github.com]:443 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+              GITHUB_HOST_KEYS
+              chmod 600 ~/.ssh/known_hosts
+              chmod 600 ~/.ssh/config
+              # Bounded retry. On 2026-11-04 10:54-11:16Z GitHub dropped SSH
+              # sessions right after the handshake (proxy tunnels were 200), every
+              # clone exited 128 and each failed run fanned out into an incident.
+              # Same key and URL on every try; git prints its own stderr.
+              for attempt in 1 2 3; do
+                if git clone --depth=1 git@github.com:mctlhq/mctl-gitops.git /workdir/mctl-gitops; then
+                  break
+                fi
+                rm -rf /workdir/mctl-gitops
+                if [ "$attempt" = 3 ]; then
+                  echo "clone-gitops: git clone failed after 3 attempts" >&2
+                  exit 128
+                fi
+                echo "clone-gitops: attempt $attempt failed, retrying" >&2
+                sleep $((attempt * 15))
+              done
+              mkdir -p /workdir/mctl-gitops/platform-gitops/agents-state
+              echo "✓ gitops cloned (fresh checkout, never touched by the agent)"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi, ephemeral-storage: 1Gi }
+            limits:   { cpu: 500m, memory: 256Mi, ephemeral-storage: 2Gi }
+          volumeMounts:
+            - name: workdir
+              mountPath: /workdir
+            - name: deploy-key
+              mountPath: /secrets/deploy-key
+      # Mutex scoped to just this template (not the whole workflow spec):
+      # only this step actually writes to mctl-gitops main, so it's the
+      # only part that needs to serialize against cwft-mctl-agents-run /
+      # wft-delete-tenant-safe. Holding the shared lock for the entire
+      # multi-minute implementer run (clone + Claude SDK + push) starved
+      # other main-writers and was implicated in workflow_failed incidents
+      # from mutex contention.
+      synchronization:
+        mutex:
+          name: mctl-gitops-main-writes
+      # Bounded on its own now that the spec-level ceiling is 8h: this is a
+      # clone plus a rebase/push loop, so 15 min is already generous, and the
+      # step that records the outcome must not be the one that hangs. Per
+      # attempt — the retryStrategy below may spend it up to 3 times.
+      activeDeadlineSeconds: 900
+      # The workflow mutex does not cover direct GitHub Actions image bumps.
+      # Retry this bounded write step when one races the in-script rebase/push
+      # loop (incident-17841555). Same policy as cwft-mctl-agents-run.
+      retryStrategy:
+        limit: "3"
+        retryPolicy: OnFailure
+        backoff:
+          duration: "30s"
+          factor: "2"
+          maxDuration: "5m"
+      script:
+        image: alpine/git:2.43.0
+        command: [sh]
+        env:
+          - name: HTTPS_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: HTTP_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: https_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: http_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: NO_PROXY
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: no_proxy
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            value: "1"
+          # Workflow params injected as env vars so the shell layer can quote
+          # them safely. Direct `workflow.parameters.*` (Argo template syntax) interpolation in
+          # the script body is a shell-injection vector — and this pod has
+          # the gitops deploy key + push access to main, so a crafted
+          # `service` / `slug` value could escalate from a malformed param
+          # into arbitrary git operations against mctl-gitops.
+          - name: WORKFLOW_SERVICE
+            value: "{{workflow.parameters.service}}"
+          - name: WORKFLOW_SLUG
+            value: "{{workflow.parameters.slug}}"
+        source: |
+          set -e
+          apk add --no-cache openssh-client ca-certificates socat
+          mkdir -p ~/.ssh
+          cp /secrets/deploy-key/ssh-privatekey ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf 'Host github.com\n  Hostname ssh.github.com\n  Port 443\n  ProxyCommand socat - PROXY:agent-egress-proxy.mctl-agents-egress.svc.cluster.local:%%h:%%p,proxyport=3128\n  IdentityFile ~/.ssh/id_ed25519\n' > ~/.ssh/config
+          # GitHub's published SSH host keys, PINNED rather than trusted on
+          # first use. Source: https://api.github.com/meta (.ssh_keys),
+          # fetched 2026-09-02. This replaces StrictHostKeyChecking=no,
+          # which accepted whatever key answered on a connection that
+          # carries a WRITE-capable deploy key: a MITM or a DNS-poison of
+          # ssh.github.com was handed that key with no complaint.
+          #
+          # Keyed on [ssh.github.com]:443, not github.com. The Host block
+          # above rewrites hostname and port, and ssh looks up what it
+          # actually connects to — a github.com entry would silently miss.
+          #
+          # If GitHub rotates a host key these lines must be updated; it
+          # last happened in March 2023, when the RSA key was replaced.
+          cat > ~/.ssh/known_hosts <<'GITHUB_HOST_KEYS'
+          [ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          [ssh.github.com]:443 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          [ssh.github.com]:443 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          GITHUB_HOST_KEYS
+          chmod 600 ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/config
+
+          # This worktree came from THIS pod's own initContainer clone, so nothing
+          # has touched it. That is the point (gitops#983 P1): git executes
+          # repository-supplied config and hooks, this container runs as root, and
+          # the write-capable deploy key is mounted here — running git inside the
+          # agent's worktree put a root-privileged push one planted hook away.
+          #
+          # It also lets `safe.directory` go: that line existed only because
+          # the old clone step chowned /workdir to uid 1000 for the agent (incident
+          # 2026-08-14 23:02). Nothing chowns this checkout, so git's ownership
+          # check stays armed. `git reset -q origin/main` goes too, along with the
+          # whole rationale above it — a pristine clone has no agent-staged index
+          # and no agent commit to unwind.
+          cd /workdir/mctl-gitops
+          git config user.name "mctl-agents[bot]"
+          git config user.email "mctl-agents[bot]@users.noreply.github.com"
+
+          # /tmp/onexit is the onExit channel, collected as an optional artifact.
+          mkdir -p /tmp/onexit
+
+          if [ ! -d /artifact ] \
+             || { [ -z "$(find /artifact/tree -type f -print -quit 2>/dev/null)" ] \
+                  && [ ! -s /artifact/deleted.lst ]; }; then
+            echo "ℹ️  No .status.yaml updates handed off — nothing to commit."
+            echo -n "none" > /tmp/onexit/activity
+            exit 0
+          fi
+
+          # Validate the handoff BEFORE any of it touches the checkout. This, not the
+          # git-status guard below, is the boundary that matters: `git status` cannot
+          # see inside `.git/`, so a file smuggled to `.git/hooks/pre-commit` would be
+          # invisible to it and would run as root with the deploy key mounted on the
+          # next git command (agy P1 on gitops#1042).
+          if [ -n "$(find /artifact -mindepth 1 ! -type d ! -type f -print -quit)" ]; then
+            echo "❌ Refusing a handoff containing a symlink or special file:" >&2
+            find /artifact -mindepth 1 ! -type d ! -type f >&2
+            exit 1
+          fi
+          BAD="$(cd /artifact/tree 2>/dev/null && find . -type f | sed 's|^\./||' | grep -vE '^platform-gitops/agents-state/.+/\.status\.yaml$' || true)"
+          if [ -n "$BAD" ]; then
+            echo "❌ Refusing a handoff with paths that are not .status.yaml under agents-state:" >&2
+            printf '%s\n' "$BAD" >&2
+            exit 1
+          fi
+          if [ -s /artifact/deleted.lst ]; then
+            BAD_DEL="$(grep -vE '^platform-gitops/agents-state/.+/\.status\.yaml$' /artifact/deleted.lst || true)"
+            if [ -n "$BAD_DEL" ]; then
+              echo "❌ Refusing a deletion list with paths that are not .status.yaml under agents-state:" >&2
+              printf '%s\n' "$BAD_DEL" >&2
+              exit 1
+            fi
+          fi
+
+          if [ -d /artifact/tree/platform-gitops/agents-state ]; then
+            mkdir -p /workdir/mctl-gitops/platform-gitops/agents-state
+            cp -a /artifact/tree/platform-gitops/agents-state/. /workdir/mctl-gitops/platform-gitops/agents-state/
+          fi
+          # Deletions travel explicitly: the copy above overlays onto a FRESH clone and
+          # is purely additive. `:(literal)` because $rel is a git PATHSPEC and a name
+          # carrying `*` would glob onto its neighbours (claude+agy P1 on gitops#1046).
+          if [ -s /artifact/deleted.lst ]; then
+            while IFS= read -r rel; do
+              [ -n "$rel" ] || continue
+              git rm -q --ignore-unmatch -- ":(literal)$rel"
+              echo "removed ${rel}"
+            done < /artifact/deleted.lst
+          fi
+
+          # Second layer, on the checkout: the same expression the PVC era used, now
+          # against a pristine clone holding only what the copy above laid down.
+          NON_STATUS_CHANGES="$(git status --porcelain -z -uall -- ':(exclude,glob)platform-gitops/agents-state/**/.status.yaml' | tr '\0' '\n' | cut -c4-)"
+          if [ -n "$NON_STATUS_CHANGES" ]; then
+            echo "❌ Refusing to commit changes outside .status.yaml files under platform-gitops/agents-state/:" >&2
+            printf '%s\n' "$NON_STATUS_CHANGES" >&2
+            exit 1
+          fi
+
+          STATUS_CHANGES="$(git status --porcelain -z -uall -- ':(glob)platform-gitops/agents-state/**/.status.yaml' | tr '\0' '\n' | cut -c4-)"
+          if [ -z "$STATUS_CHANGES" ]; then
+            echo "ℹ️  No .status.yaml updates — nothing to commit."
+            echo -n "none" > /tmp/onexit/activity
+            exit 0
+          fi
+          git add -- ':(glob)platform-gitops/agents-state/**/.status.yaml'
+
+          if git diff --cached --quiet; then
+            # Defensive: STATUS_CHANGES already proved there are matches,
+            # but keep this guard in case `git add` ever ends up staging
+            # an empty diff (e.g. a permissions-only change git ignores).
+            echo "ℹ️  No status updates after staging — nothing to commit."
+            echo -n "none" > /tmp/onexit/activity
+            exit 0
+          fi
+
+          DATE=$(date -u +%Y-%m-%d)
+          if [ -n "$WORKFLOW_SLUG" ]; then
+            MSG="chore(agents): implement ${WORKFLOW_SLUG} ${DATE}"
+          elif [ -n "$WORKFLOW_SERVICE" ]; then
+            MSG="chore(agents): implement ${WORKFLOW_SERVICE} ${DATE}"
+          else
+            MSG="chore(agents): implement run ${DATE}"
+          fi
+          git commit -m "$MSG"
+
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              echo "✅ Pushed status updates"
+              echo -n "yes" > /tmp/onexit/activity
+              exit 0
+            fi
+            echo "⚠️  Push failed (attempt ${i}), rebasing..."
+            # Guarded: `set -e` is active, so an unguarded failure here —
+            # a rebase conflict, a transient network error — kills the
+            # script on the FIRST retry instead of trying the remaining
+            # attempts, and the "failed after 5 attempts" line never prints
+            # (agy P3 on gitops#982). Abort a half-applied rebase so the
+            # next iteration starts from a clean worktree.
+            if ! git pull --rebase origin main; then
+              git rebase --abort 2>/dev/null || true
+              echo "⚠️  Rebase failed (attempt ${i}); retrying" >&2
+            fi
+          done
+          echo "❌ Push failed after 5 attempts"
+          exit 1
+        # No resources were declared on this step at all — it was unbounded
+        # on cpu and memory as well as on disk. ephemeral-storage matters
+        # most: the workdir is an emptyDir now, so an unaccounted pod can
+        # pack onto a node beside vault and shared-pg and push it into
+        # DiskPressure.
+        resources:
+          requests: { cpu: 50m, memory: 64Mi, ephemeral-storage: 1Gi }
+          limits:   { cpu: 500m, memory: 256Mi, ephemeral-storage: 2Gi }
+        volumeMounts:
+          - name: workdir
+            mountPath: /workdir
+          - name: deploy-key
+            mountPath: /secrets/deploy-key
+
+    # ── 2b. Assert the bounded attempt succeeded ───────────────────────────
+    - name: assert-attempt
+      inputs:
+        parameters:
+          - name: primary
+          - name: fallback
+      script:
+        image: alpine:3.19
+        command: [sh]
+        env:
+          - name: PARAM_PRIMARY
+            value: "{{inputs.parameters.primary}}"
+          - name: PARAM_FALLBACK
+            value: "{{inputs.parameters.fallback}}"
+        source: |
+          PRIMARY="$PARAM_PRIMARY"
+          FALLBACK="$PARAM_FALLBACK"
+          echo "primary attempt: ${PRIMARY:-<none>}   fallback attempt: ${FALLBACK:-<none>}"
+          if [ "$PRIMARY" = "Succeeded" ] || [ "$FALLBACK" = "Succeeded" ]; then
+            echo "✓ An attempt succeeded — workflow status reflects real work."
+            exit 0
+          fi
+          echo "❌ Neither the primary attempt nor the account-2 fallback succeeded; inspect the durable needs-triage reason." >&2
+          echo "   Most often the Claude five_hour/seven_day usage limit / HTTP 429 on both accounts, or token-2 unset." >&2
+          exit 1
+
+    # ── 3. Telegram notification (onExit) ──────────────────────────────────
+    # Same pattern as cwft-mctl-agents-run / cwft-mctl-agents-shepherd.
+    - name: notify-telegram
+      initContainers:
+        # kube-router admits a new pod's IP into the proxy's ingress ipset a
+        # few seconds after the pod starts; a first connection inside that
+        # window is dropped (gitops#2164). Hold the pod until the proxy
+        # accepts a TCP connect, at most ~90s.
+        - name: wait-egress-proxy
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              for i in $(seq 1 30); do
+                nc -z -w 2 agent-egress-proxy.mctl-agents-egress.svc.cluster.local 3128 && exit 0
+                sleep 1
+              done
+              echo "agent-egress-proxy unreachable after ~90s" >&2
+              exit 1
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 16Mi}
+      inputs:
+        artifacts:
+          # What this onExit handler needs, addressed by literal S3 key. onExit
+          # pods get their own emptyDir, so the shared-PVC file this used to
+          # read is gone; and `workflow.outputs.parameters` is not an
+          # alternative — see the note above `templates:`.
+          #
+          # `optional: true`: a commit step that never ran, or crashed before
+          # writing, simply leaves the object absent and the missing-file
+          # fallback below reads "unknown". Verified on the shepherd canary
+          # that an onExit template resolves such a key with the producer
+          # skipped, running, and absent.
+          - name: activity
+            path: /onexit/commit
+            optional: true
+            s3:
+              key: "{{workflow.name}}/onexit-activity.tgz"
+      script:
+        image: alpine:3.19
+        command: [sh]
+        env:
+          - name: HTTPS_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: HTTP_PROXY
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: https_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: http_proxy
+            value: "http://agent-egress-proxy.mctl-agents-egress.svc.cluster.local:3128"
+          - name: NO_PROXY
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: no_proxy
+            value: ".svc,.svc.cluster.local,.cluster.local,10.43.0.1,10.43.0.0/16,10.0.0.0/8,kubernetes.default,localhost,127.0.0.1"
+          - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            value: "1"
+          - name: TG_BOT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: telegram-bot-token
+                optional: true
+          - name: TG_CHAT_ID
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: telegram-chat-id
+                optional: true
+          - name: MCTL_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: mctl-agents-secrets
+                key: mctl-token
+                optional: true
+          # Workflow params + status injected as env vars so the shell layer
+          # can quote them safely. Even though this is just a notification
+          # step, raw `workflow.parameters.*` (Argo template syntax) interpolation is still
+          # arbitrary command execution in a workflow pod.
+          - name: WORKFLOW_STATUS
+            value: "{{workflow.status}}"
+          # Identifies which CWFT this onExit handler belongs to — used to
+          # namespace the incident fingerprint below so run/implement/shepherd
+          # failures never collide with each other.
+          - name: WORKFLOW_TEMPLATE_KIND
+            value: "implement"
+          - name: WORKFLOW_SERVICE
+            value: "{{workflow.parameters.service}}"
+          - name: WORKFLOW_SLUG
+            value: "{{workflow.parameters.slug}}"
+          - name: WORKFLOW_NAME
+            value: "{{workflow.name}}"
+          - name: WORKFLOW_DURATION
+            value: "{{workflow.duration}}"
+        source: |
+          set +e
+          apk add --no-cache curl ca-certificates jq >/dev/null 2>&1
+
+          # "none" when commit-and-push had nothing to commit (a run whose
+          # proposal queue was empty). Read from the artifact mounted at
+          # /onexit/commit rather than a workflow output parameter — see the
+          # note above `templates:` for why this file has none.
+          WORKFLOW_ACTIVITY=$(cat /onexit/commit/activity 2>/dev/null || echo "unknown")
+
+          # Stable dedup key for this recurring job. Two failures of the same
+          # {service, slug} scope collapse into one open incident instead of
+          # a fresh one per tick; a differing service/slug still gets its own.
+          FINGERPRINT="workflow_failed:${WORKFLOW_TEMPLATE_KIND}:${WORKFLOW_SERVICE}:${WORKFLOW_SLUG}"
+
+          case "$WORKFLOW_STATUS" in
+            Succeeded) ICON="✅" ;;
+            Failed)    ICON="❌" ;;
+            Error)     ICON="⚠️" ;;
+            *)         ICON="⏳" ;;
+          esac
+          if [ -n "$WORKFLOW_SLUG" ]; then
+            SUBJECT="implement ${WORKFLOW_SLUG}"
+          elif [ -n "$WORKFLOW_SERVICE" ]; then
+            SUBJECT="implement ${WORKFLOW_SERVICE}"
+          else
+            SUBJECT="implement (all accepted)"
+          fi
+          UI_URL="https://workflows.mctl.ai/workflows/argo-workflows/${WORKFLOW_NAME}"
+          TEXT="${ICON} mctl-agents: ${SUBJECT} — ${WORKFLOW_STATUS} (${WORKFLOW_DURATION}s)\n${UI_URL}"
+
+          # Telegram leg: failures only.
+          # A DevLoop item used to produce a ✅ from investigate, another from
+          # implement, and one per shepherd tick: 2026-10-19..24 carried more than
+          # 100 of them against a handful of real outcomes. The outcome a human
+          # acts on is the PR's terminal state, which shepherd reports once
+          # (merged / rejected / review-stuck); a Succeeded run here is a step
+          # on the way and stays silent. Failed/Error/Unknown always notify.
+          if [ "$WORKFLOW_STATUS" = "Succeeded" ]; then
+            echo "ℹ️  Succeeded (activity=${WORKFLOW_ACTIVITY}) — shepherd reports the PR outcome; skipping Telegram leg."
+          elif [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -o /dev/null -w 'telegram http=%{http_code}\n' \
+              -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${TG_CHAT_ID}\",\"text\":\"${TEXT}\",\"disable_web_page_preview\":true}"
+          else
+            echo "ℹ️  TG_BOT_TOKEN or TG_CHAT_ID not set; skipping Telegram leg."
+          fi
+
+          # Incident leg — only on terminal failure/success. See B6 G3 in
+          # ~/.claude/plans/mctl-agents-daily-cron-visibility.md.
+          if { [ "$WORKFLOW_STATUS" = "Failed" ] || [ "$WORKFLOW_STATUS" = "Error" ]; } && [ -n "$MCTL_TOKEN" ]; then
+            # Suffix the id with epoch-second so `argo retry <wf>`
+            # produces a fresh incident — workflow names/UIDs stay
+            # stable across retries (Codex P2 on PR #149). Real cross-run
+            # dedup now happens via `fingerprint` below.
+            INCIDENT_ID="argo-${WORKFLOW_NAME}-$(date +%s)"
+            SUMMARY="implement ${SUBJECT} ${WORKFLOW_STATUS} after ${WORKFLOW_DURATION}s — ${UI_URL}"
+            # JSON-encode via jq so quotes / newlines / backslashes in
+            # WORKFLOW_SLUG / WORKFLOW_SERVICE cannot break the body.
+            BODY=$(jq -nc --arg id "$INCIDENT_ID" --arg summary "$SUMMARY" --arg fingerprint "$FINGERPRINT" '{
+              id: $id,
+              source: "argo-workflows",
+              type: "workflow_failed",
+              tenant: "admins",
+              service: "mctl-agents",
+              summary: $summary,
+              severity: "warning",
+              # "analyzing", not "open": the incident-responder discovery
+              # query only picks up status=analyzing, and nothing in mctl-api
+              # ever promotes open->analyzing — a status of "open" here means
+              # the incident sits unanalyzed forever (observed 2026-07-12:
+              # 6 self-reported workflow_failed incidents never picked up).
+              status: "analyzing",
+              fingerprint: $fingerprint
+            }')
+            curl -s -o /dev/null -w 'incident http=%{http_code}\n' \
+              -X POST "https://api.mctl.ai/api/v1/incidents" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${MCTL_TOKEN}" \
+              -d "$BODY"
+          elif [ "$WORKFLOW_STATUS" = "Succeeded" ] && [ "$WORKFLOW_ACTIVITY" = "none" ]; then
+            # A "successful" no-op is NOT evidence of recovery. Resolving here
+            # would close an incident for work that was only reconciled or
+            # skipped, not fixed. Leave it open for explicit operator triage.
+            echo "ℹ️  Succeeded with no activity — not resolving fingerprint (no confirmed fix)."
+          elif [ "$WORKFLOW_STATUS" = "Succeeded" ] && [ -n "$MCTL_TOKEN" ]; then
+            # Close the loop: this scope's implement run finally succeeded
+            # AND committed real work, so resolve any open incident sharing
+            # this fingerprint. No-op if none exists.
+            RESOLVE_BODY=$(jq -nc --arg tenant "admins" --arg fingerprint "$FINGERPRINT" '{tenant: $tenant, fingerprint: $fingerprint}')
+            curl -s -o /dev/null -w 'resolve http=%{http_code}\n' \
+              -X POST "https://api.mctl.ai/api/v1/incidents/resolve-by-fingerprint" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${MCTL_TOKEN}" \
+              -d "$RESOLVE_BODY"
+          else
+            echo "ℹ️  Workflow ${WORKFLOW_STATUS} or MCTL_TOKEN missing; skipping incident leg."
+          fi
+          exit 0
