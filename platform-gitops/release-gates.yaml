@@ -25,3 +25,7 @@ gates:
     # only after the preview rehearsal, and that PR adds the requirement here.
     # tests/test_release_gate.py fails if the values file declares Recreate
     # while this gate does not require it.
+    requires:
+      - path: platform-gitops/services/admins/mctl-agents-worker/values.yaml
+        key: strategy.type
+        equals: Recreate
